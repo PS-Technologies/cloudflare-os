@@ -577,6 +577,21 @@ export default {
           { gadgetId: env.WORKSHOP_OVERSEER.idFromName(`test:${gadgetKey}`).toString() });
     }
 
+    // Grant a person Build on an external workspace through the gateway, as an authenticated
+    // channel (Teams ingress auto-admit) does. A refusal is reported, not thrown.
+    // Body: {"gadgetKey": "...", "username": "..."} -> {"collaborator": ...} | {"error": string}
+    if (url.pathname === "/control/add-external-collaborator" && req.method === "POST") {
+      const { gadgetKey, username } = body as Record<string, unknown>;
+      if (!isNonEmptyString(gadgetKey)) return badRequest("`gadgetKey` must be a non-empty string");
+      if (!isNonEmptyString(username)) return badRequest("`username` must be a non-empty string");
+      try {
+        return Response.json({ collaborator: await env.WORKSHOP_EXTERNAL_MESSAGES.addCollaborator(
+            { gadgetKey, username, role: "build" }) });
+      } catch (err) {
+        return Response.json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
     // Make this Worker issue a subrequest, so a test can prove that Worker-originated fetches really
     // do route through the interceptor rather than out to the internet.
     //

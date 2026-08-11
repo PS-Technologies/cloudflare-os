@@ -10143,6 +10143,50 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * Grant Build (or another role) to an existing account on behalf of the workspace owner.
+   *
+   * Used by ExternalMessageGateway when a Teams (or other) gateway has already authenticated the
+   * username. This is not the session-bound Overseer.addCollaborator path — there is no browser
+   * client here — so the share is attributed to the owner. Returns null when the username has no
+   * account (same contract as Overseer.addCollaborator). Throws when sharing is prohibited.
+   */
+  async addExternalCollaborator(input: {
+    username: string;
+    role: CollaboratorRole;
+    note?: string;
+  }): Promise<CollaboratorInfo | null> {
+    let ownerProfileId = this.impl.ownerProfileId;
+    if (!ownerProfileId) {
+      // Workspace has not been claimed yet; there is nothing to share into.
+      return null;
+    }
+
+    let userDo = this.impl.users.get(this.impl.users.idFromName(input.username));
+    let profile = await userDo.whoamiIfExists();
+    if (!profile) return null;
+
+    if (this.impl.storage.containsRestrictedData.get()) {
+      throw new Error(
+          "This workspace has observed sensitive data. To prevent leaks, the workspace cannot be " +
+          "shared.");
+    }
+    // The grant below is attributed to the owner, so it would pass SharingManager's
+    // owner-invites-only check without the owner having chosen this person. Once that latch is
+    // set, only the owner adds people.
+    if (this.impl.storage.ownerInvitesOnly.get()) {
+      throw new Error(
+          "Only the workspace owner can add people to a workspace that contains sensitive data.");
+    }
+
+    return (await this.impl.getSharingManager()).addCollaborator({
+      caller: { profileId: ownerProfileId, isOwner: true },
+      profile,
+      role: input.role,
+      note: input.note,
+    });
+  }
+
+  /**
    * Initialize this workspace's default gadget from a blueprint's code snapshot. Called by
    * AuthenticatedApi.newGadgetFromBlueprint() after creating (and opening) the DO.
    */
