@@ -2727,20 +2727,26 @@ class OverseerImpl implements AgentHooks {
   async addGatekeeper(cls: GatekeeperClass, creationSpec?: GatekeeperCreationSpec)
       : Promise<GatekeeperClient<any>> {
     let id = this.allocateWorkpieceId();
-    let gatekeeperRecord: GatekeeperRecord = {
-      id,
-      class: cls,
-      creationSpec,
-    };
-    this.storage.gatekeepers.put(gatekeeperRecord);
-
-    let facet = this.getGatekeeperFacet(id);
+    // Mint the facet from the in-memory class. getGatekeeperFacet re-reads class from
+    // storage, so it cannot run this first describe — a hang on persisting a transferred
+    // DurableObjectClass would otherwise leave describe() unreachable.
+    let facet = this.ctx.facets.get(`gatekeeper${id}`, async () => ({class: cls}));
     try {
       let description = await facet.describe();
-      gatekeeperRecord.resourceTitle = description.title;
-      gatekeeperRecord.resourceUrl = description.url;
-      gatekeeperRecord.hasSlashCommands = description.hasSlashCommands;
-      this.storage.gatekeepers.put(gatekeeperRecord);
+      this.storage.gatekeepers.put({
+        id,
+        class: cls,
+        creationSpec,
+        resourceTitle: description.title,
+        resourceUrl: description.url,
+        hasSlashCommands: description.hasSlashCommands,
+      });
+      // Emitted after the put returns, so its absence beside a successful describe() is the
+      // signal that persisting a transferred DurableObjectClass is itself what stalls.
+      this.logger.info("persisted gatekeeper record", {
+        event: "gatekeeper.record.persisted",
+        gatekeeperId: id, operation: creationSpec?.type ?? "named",
+      });
     } catch (error) {
       this.removeGatekeeper(id);
       throw error;
@@ -4559,14 +4565,25 @@ class OverseerImpl implements AgentHooks {
     // further round-trips through the owner's user DO. The account capability stays encapsulated in
     // that DO — only the class reference crosses out.
     //
-    // Provision concurrently so Cap'n Web can batch the owner-DO class lookups; addGatekeeper assigns
-    // ids before awaiting, so concurrent adds don't collide.
-    await Promise.all(toAdd.map(async account => {
-      // Best-effort and isolated per account: a single failing account (e.g. its
-      // getSingletonGatekeeperClass throws) must not block the others or the rest of open().
+    // Look up classes concurrently so Cap'n Web can batch the owner-DO RPCs. Persist and describe
+    // sequentially after that: two DurableObjectClass writes into the same Overseer during open()
+    // is the 330-era storage-timeout signature. addGatekeeper still assigns ids before awaiting.
+    let resolved = await Promise.all(toAdd.map(async account => {
+      // Best-effort and isolated per account: a single failing lookup must not block the others
+      // or the rest of open().
       try {
-        let cls = await ownerDo.getSingletonGatekeeperClass(account.accountId);
-        if (!cls) return;
+        return {account, cls: await ownerDo.getSingletonGatekeeperClass(account.accountId)};
+      } catch (err) {
+        this.logger.error("failed to look up ambient gatekeeper class", {
+          event: "ambient.capsule.lookup.failed",
+          vendorId: account.vendorId, accountId: account.accountId, error: err,
+        });
+        return {account, cls: null};
+      }
+    }));
+    for (let {account, cls} of resolved) {
+      if (!cls) continue;
+      try {
         // Provision as an unnamed record: it reaches the agent through each chat's env (named at
         // seed time from the gatekeeper's suggested binding name), not as any gadget's binding.
         await this.addGatekeeper(
@@ -4578,7 +4595,7 @@ class OverseerImpl implements AgentHooks {
           vendorId: account.vendorId, accountId: account.accountId, error: err,
         });
       }
-    }));
+    }
   }
 
   // Derive the workspace's default binding list -- the seed binding layer for new (non-spawned)
