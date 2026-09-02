@@ -3036,10 +3036,22 @@ export type AiToolCall = {
    * theirs so reverts can be referred to precisely.
    *
    * `blueprintNotes` is present for blueprint instantiations: formatted text describing the files
-   * copied in and the bindings the blueprint expects the agent to wire up. Recorded so replay
-   * doesn't have to re-fetch the blueprint (whose content may have changed since).
+   * copied in and the bindings the blueprint expects, plus the wiring report for those bindings.
+   * Recorded so replay doesn't have to re-fetch the blueprint (whose content may have changed since)
+   * or re-run wiring (which would create a second set of gatekeepers).
+   *
+   * `wiring` is the structured report of which blueprint connections were bound and which still
+   * need Connections. Absent when the gadget was created empty (no blueprintId).
    */
-  output?: {gadgetId: WorkpieceId, changeId?: number, blueprintNotes?: string};
+  output?: {
+    gadgetId: WorkpieceId;
+    changeId?: number;
+    blueprintNotes?: string;
+    wiring?: {
+      wired: {name: string, type: string, detail: string}[];
+      unresolved: {name: string, type: string, reason: string}[];
+    };
+  };
 } | {
   toolName: "executeCode";
   input: {
