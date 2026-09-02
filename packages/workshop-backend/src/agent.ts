@@ -26,6 +26,7 @@ import {
   getModelTokenLimits, isCompactionTurn, protectRetainedReverts, shouldCompactChat,
   type CompactionProjectionMessage,
 } from "./agent-compaction";
+import { formatWiringReport, type WiringReport } from "./blueprint-wiring";
 
 const logger = createWorkshopLogger("workshop.agent");
 
@@ -675,6 +676,17 @@ export interface AgentHooks {
    */
   fetchBlueprint(blueprintId: string)
       : Promise<{files: Record<string, string>, notes: string, output?: BlueprintOutput}>;
+
+  /**
+   * After createGadget has minted a gadget from a blueprint's code, wire that blueprint's
+   * connections using the acting user's accounts and model catalog, with the same auto-assign
+   * rules as the blueprint landing page's Create button. Returns the wiring report (recorded in
+   * the tool result so replay does not create a second set of gatekeepers) and the pending
+   * binding edges the caller must stamp on the step's "changes" message.
+   */
+  wireBlueprintBindings(
+      gadgetId: WorkpieceId, blueprintId: string, initiator: AiChatAuthorInfo, chatId: number)
+      : Promise<{ report: WiringReport; addedBindings: {name: string; target: WorkpieceId}[] }>;
 }
 
 // =======================================================================================
@@ -940,7 +952,7 @@ Create a new Gadget in this workspace. The new gadget immediately becomes availa
 
 Use this when the user's request or established context clearly calls for a new application or saved output. An empty workspace or a one-off task does not require a gadget. Always choose a short, descriptive title — the user will see it.
 
-By default the new gadget is empty. Pass \`blueprintId\` (discovered with the \`listBlueprints\` tool, or given by the user) to instead start the gadget from a blueprint's code; the result then also describes the bindings the blueprint expects you to wire up.
+By default the new gadget is empty. Pass \`blueprintId\` (discovered with the \`listBlueprints\` tool, or given by the user) to instead start the gadget from a blueprint's code. A blueprint's connections are wired automatically where the person's accounts and model catalog allow; the result lists any row still needing Connections, so tell the person the exact click path instead of guessing.
 `.trim();
 
 let CREATE_WORKTREE_TOOL_DESCRIPTION = `
@@ -3039,7 +3051,8 @@ async function runAgentPass(
           // (exactly as writeFile/editFile do) so reverts can be referred to precisely.
           let changeId = nextChangeId;
 
-          let output: {gadgetId: WorkpieceId, changeId: number, blueprintNotes?: string} =
+          let output: {gadgetId: WorkpieceId, changeId: number, blueprintNotes?: string,
+                       wiring?: WiringReport} =
               {gadgetId: created.id, changeId};
 
           if (blueprint) {
@@ -3062,7 +3075,21 @@ async function runAgentPass(
             // its creating call -- which replay handles fine: the message's replay applies the
             // files, and the call's replay just returns its recorded output.)
 
-            output.blueprintNotes = blueprint.notes;
+            // Wire the blueprint's connections once, at execute time, using the same auto-assign
+            // rules as the landing-page Create button. The report is recorded on the tool output
+            // so history replay returns it without creating a second set of gatekeepers (the
+            // same recorded-result pattern setGadgetBinding uses).
+            let wiring = await hooks.wireBlueprintBindings(
+                created.id, blueprintId!, initiator, chatId);
+            for (let edge of wiring.addedBindings) {
+              pendingAddedBindings.push(
+                  {gadgetId: created.id, name: edge.name, target: edge.target});
+            }
+            output.wiring = wiring.report;
+            let wiringText = formatWiringReport(wiring.report);
+            output.blueprintNotes = wiringText
+                ? `${blueprint.notes}\n\n${wiringText}`
+                : blueprint.notes;
           }
 
           // Persist the result as the tool's recorded output: history replay can't re-run a
