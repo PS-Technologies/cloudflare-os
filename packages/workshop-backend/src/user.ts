@@ -1374,6 +1374,58 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return record.account.ensureResources(resourceUrlPatterns);
   }
 
+  /**
+   * One-shot snapshot of the acting user's Connectors list, carrying the same fields
+   * subscribeConnectedAccounts delivers (vendorId, credentialsValid, supportedResources) and the
+   * same admin/auto-provision filters. Used by chat createGadget wiring: a subscribe callback
+   * into the Overseer would deadlock the two DOs.
+   */
+  async listConnectedAccountsSnapshot(): Promise<{
+    id: number;
+    vendorId: string;
+    credentialsValid: boolean;
+    supportedResources: SupportedResource[];
+  }[]> {
+    let config = await readAdminConfig(this.env);
+    let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
+    let result: {
+      id: number;
+      vendorId: string;
+      credentialsValid: boolean;
+      supportedResources: SupportedResource[];
+    }[] = [];
+
+    for (let record of this.#connectedAccountRecords()) {
+      if (record.autoProvisioned) {
+        let mode = ambientGatekeeperMode(config, record.vendorId);
+        if (mode === "disabled" || mode === "enabled") continue;
+      }
+      if (disabledGatekeeperSet.has(record.vendorId)) continue;
+
+      let vendor = this.vendors.get(record.vendorId);
+      if (!vendor) continue;
+
+      let supportedResources: SupportedResource[] = [];
+      try {
+        supportedResources = await record.account.getSupportedResources();
+        supportedResources = filterEnabledResources(config, record.vendorId, supportedResources);
+      } catch (err) {
+        logger.warn("failed to get supported resources for connected account", {
+          event: "connected.account.supported.resources.failed",
+          accountId: record.id, vendorId: record.vendorId, error: err,
+        });
+      }
+
+      result.push({
+        id: record.id,
+        vendorId: record.vendorId,
+        credentialsValid: areCredentialsValid(record),
+        supportedResources,
+      });
+    }
+    return result;
+  }
+
   async subscribeConnectedAccounts(
       subscriber: RpcStub<ConnectedAccountsSubscriber>, filter?: ConnectedAccountsFilter)
       : Promise<RpcStub<{}>> {

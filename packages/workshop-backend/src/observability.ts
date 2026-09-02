@@ -37,6 +37,12 @@ export type WorkshopObservabilityFields = {
   toolCallId: string;
   toolName: string;
   vendorId: string;
+  wiredCount: number;
+  unresolvedCount: number;
+  wiredByType: string;
+  unresolvedByType: string;
+  wiredNames: string;
+  unresolvedNames: string;
 };
 
 /** Ambient observability fields for one Workshop operation. */
