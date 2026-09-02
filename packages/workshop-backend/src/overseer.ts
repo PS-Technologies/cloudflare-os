@@ -44,13 +44,16 @@ import {
   getAiGatewayLogCost,
   type AiGatewayLogRoute,
 } from "./ai-gateway";
-import { AgentGadgetInfo, AgentHooks, SeedBindingInfo, agentCodeChangeShape, alwaysAvailableResources, formatMissingBlueprintBindings, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
+import { AgentGadgetInfo, AgentHooks, SeedBindingInfo, agentCodeChangeShape, alwaysAvailableResources, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import { GitImpl } from "./git-binding";
 import { GadgetExportsImpl } from "./exports-session";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import EXPORTS_BINDING_TYPES from "./exports-binding.txt";
+import {
+  applyBlueprintWiring, countsByType, type CatalogAccount, type CatalogModel, type WiringReport,
+} from "./blueprint-wiring";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
 import { chatChangeStatuses, foldCompactedCode, isTurnPrompt } from "./agent-compaction";
 import type { CachedRequest } from "./ai-models";
@@ -9573,6 +9576,7 @@ class OverseerImpl implements AgentHooks {
   async fetchBlueprint(blueprintId: string): Promise<{
     files: Record<string, string>, notes: string, output?: BlueprintOutput,
     merge: Omit<BlueprintMerge, "gadgetId">,
+    bindings: Record<string, BlueprintBinding>,
   }> {
     let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
     if (!kvRecord) {
@@ -9605,10 +9609,40 @@ class OverseerImpl implements AgentHooks {
           `them before editing.`
         : `The blueprint contained no files, so the new gadget is empty.`);
 
-    let {bindings} = kvRecord.metadata;
-    lines.push("", Object.keys(bindings).length === 0
-        ? `The blueprint requires no bindings.`
-        : formatMissingBlueprintBindings(bindings, `the new gadget`));
+    let bindings = Object.entries(kvRecord.metadata.bindings);
+    if (bindings.length === 0) {
+      lines.push("", `The blueprint requires no bindings.`);
+    } else {
+      lines.push("",
+          `The blueprint's code expects the following bindings. They are wired automatically ` +
+          `from this person's connected accounts and model catalog where those allow; the ` +
+          `createGadget result lists any row still needing Connections, so tell the person the ` +
+          `exact click path rather than guessing.`);
+      for (let [name, binding] of bindings) {
+        let details: string;
+        switch (binding.type) {
+          case "gatekeeper":
+            details = `external resource via the "${binding.gatekeeperName}" gatekeeper; ` +
+                `resource URL pattern ${JSON.stringify(binding.typeUrlPattern)}` +
+                (binding.resourceUrl
+                    ? `; the blueprint author suggests ${JSON.stringify(binding.resourceUrl)}`
+                    : ``);
+            break;
+          case "aiModel":
+            details = `an AI model binding`;
+            break;
+          case "agentSpawner":
+            details = `an agent-spawner binding`;
+            break;
+          default:
+            binding satisfies never;
+            details = `unknown`;
+            break;
+        }
+        lines.push(`* ${name} — ${JSON.stringify(binding.title)} (${details})` +
+            (binding.description ? `: ${binding.description}` : ``));
+      }
+    }
 
     // What the creation is recorded as. The new gadget's files are the release's exactly, with
     // nothing to merge them against.
@@ -9618,7 +9652,120 @@ class OverseerImpl implements AgentHooks {
       ...this.#missingBlueprintBindings(kvRecord.metadata),
     };
 
-    return {files, notes: lines.join("\n"), output, merge};
+    return {files, notes: lines.join("\n"), output, merge, bindings: kvRecord.metadata.bindings};
+  }
+
+  // Wire a blueprint's connections onto a chat-created gadget, acting as the turn's initiator:
+  // only that person's accounts and models, no OAuth, nothing the landing-page Create button
+  // would not grant. Binding edges use addGadgetBinding so a pending gadget accepts them.
+  async wireBlueprintBindings(
+      gadgetId: WorkpieceId, blueprintId: string, initiator: AiChatAuthorInfo, chatId: number,
+      bindings: Record<string, BlueprintBinding>)
+      : Promise<{ report: WiringReport; addedBindings: {name: string; target: WorkpieceId}[] }> {
+    if (Object.keys(bindings).length === 0) {
+      return { report: { wired: [], unresolved: [] }, addedBindings: [] };
+    }
+
+    let userStub = wrapDoStubForTelemetry(
+        this.users.get(this.users.idFromName(initiator.id)), this.logger);
+    let models: CatalogModel[] = (await retryOnDoReset(
+        () => userStub.listModels(), this.logger)).map(m => ({ id: m.id, name: m.name }));
+    let accounts: CatalogAccount[] = await retryOnDoReset(
+        () => userStub.listConnectedAccountsSnapshot(), this.logger);
+
+    let result = await applyBlueprintWiring(gadgetId, bindings, models, accounts, {
+      createGatekeeper: (accountId, resourceUrl) =>
+          this.#createUserGatekeeper(userStub, accountId, resourceUrl),
+      createAiModel: (modelId) => this.#createUserAiModel(userStub, modelId),
+      createAgentSpawner: (config) =>
+          this.#createUserAgentSpawner(userStub, chatId, config),
+      bind: (name, target) => this.addGadgetBinding(gadgetId, name, target, chatId),
+    });
+
+    this.logger.info("wired blueprint bindings", {
+      event: "blueprint.bindings.wired",
+      blueprintId,
+      wiredCount: result.report.wired.length,
+      unresolvedCount: result.report.unresolved.length,
+      wiredByType: countsByType(result.report.wired),
+      unresolvedByType: countsByType(result.report.unresolved),
+      wiredNames: result.report.wired.map(r => r.name).join(",") || "none",
+      unresolvedNames: result.report.unresolved.map(r => r.name).join(",") || "none",
+    });
+    return result;
+  }
+
+  async #createUserGatekeeper(
+      userStub: DurableObjectStub<UserDurableObject>, accountId: number, resourceUrl: string)
+      : Promise<WorkpieceId> {
+    let {class: cls, vendorId, typeUrlPattern} = await retryOnDoReset(
+        () => userStub.getGatekeeperClassFor(accountId, resourceUrl), this.logger);
+    let creationSpec: GatekeeperCreationSpec = {
+      type: "gatekeeper",
+      vendorId,
+      resourceUrl,
+      typeUrlPattern,
+    };
+    let result = await this.addGatekeeper(cls, creationSpec);
+    return await result.getId();
+  }
+
+  async #createUserAiModel(
+      userStub: DurableObjectStub<UserDurableObject>, modelId: string): Promise<WorkpieceId> {
+    let chatMeta = await retryOnDoReset(() => userStub.getChatContext(modelId), this.logger);
+    let props: AiModelGatekeeperProps = {
+      displayName: chatMeta.aiModel!.profile.name,
+      config: chatMeta.aiModel!.config,
+      initiator: {
+        type: "gadget",
+        id: chatMeta.profile.id,
+        name: this.storage.title.get(),
+      },
+      metadata: { source: "model-binding", gadgetId: this.ctx.id.toString() },
+    };
+    let creationSpec: GatekeeperCreationSpec = {
+      type: "aiModel",
+      modelId,
+      provider: chatMeta.aiModel!.config.provider,
+      modelName: chatMeta.aiModel!.config.model,
+    };
+    let result = await this.addGatekeeper(
+        this.ctx.exports.LanguageModelGatekeeper({props}), creationSpec);
+    return await result.getId();
+  }
+
+  async #createUserAgentSpawner(
+      userStub: DurableObjectStub<UserDurableObject>, chatId: number,
+      {env, ...config}: AgentSpawnerConfig): Promise<WorkpieceId> {
+    // The gadget being wired is pending in this chat; a spawner may point at it, as at any gadget
+    // the chat proposes, and is accepted along with it. The spawner's bindings live on its record
+    // (GatekeeperRecord.bindings), as newAgentSpawnerGatekeeper stores them.
+    for (let [name, target] of Object.entries(env)) {
+      this.validateSpawnerBinding(name, target, chatId);
+    }
+    let bindings = Object.fromEntries(
+        Object.entries(env).map(([name, target]) => [name, {target}]));
+
+    let props: AgentSpawnerBindingProps = {
+      config,
+      creatorUserId: userStub.id.toString(),
+    };
+    let creationSpec: GatekeeperCreationSpec = {
+      type: "agentSpawner",
+      config,
+    };
+    if (config.modelId) {
+      let chatMeta = await retryOnDoReset(
+          () => userStub.getChatContext(config.modelId), this.logger);
+      if (chatMeta.aiModel) {
+        creationSpec.modelProvider = chatMeta.aiModel.config.provider;
+        creationSpec.modelName = chatMeta.aiModel.config.model;
+      }
+    }
+    let result = await this.addGatekeeper(
+        this.ctx.exports.AgentSpawnerGatekeeper({props}), creationSpec, userStub.id.toString(),
+        undefined, bindings);
+    return await result.getId();
   }
 
   #tailSubscribers: Set<RpcStub<ConsoleLogSubscriber>> = new Set();
