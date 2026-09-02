@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { classifyMatch, completeUrl, getPlaceholderRanges } from './resourceMatching'
+import { classifyMatch, completeUrl, getPlaceholderRanges, normalizeResourceUrl } from './resourceMatching'
 
 const CHAT_SPACE = 'https://chat.google.com/:kind(room|dm)/:spaceId'
 const CHAT_THREAD = 'https://chat.google.com/:kind(room|dm)/:spaceId/:threadId{/:messageId}?'
@@ -119,5 +119,25 @@ describe('completeUrl', () => {
 describe('getPlaceholderRanges', () => {
   it('leaves a query value that starts with a colon alone', () => {
     expect(getPlaceholderRanges('https://github.com/o/r/issues?q=:open')).toEqual([])
+  })
+})
+
+describe('normalizeResourceUrl', () => {
+  it('prepends https:// to a schemeless host', () => {
+    expect(normalizeResourceUrl('example.com/site')).toBe('https://example.com/site')
+  })
+
+  it('leaves http and https URLs alone', () => {
+    expect(normalizeResourceUrl('https://example.com/a')).toBe('https://example.com/a')
+    expect(normalizeResourceUrl('http://example.com/a')).toBe('http://example.com/a')
+  })
+
+  it('leaves a vendor scheme alone instead of nesting it under https://', () => {
+    expect(normalizeResourceUrl('proposal://workspace')).toBe('proposal://workspace')
+  })
+
+  it('strips a trailing /* wildcard', () => {
+    expect(normalizeResourceUrl('example.com/site/*')).toBe('https://example.com/site')
+    expect(normalizeResourceUrl('proposal://workspace/*')).toBe('proposal://workspace')
   })
 })

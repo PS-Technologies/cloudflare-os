@@ -159,8 +159,10 @@ export function matchesResourceText(search: string, resource: SupportedResource)
  */
 export function normalizeResourceUrl(url: string): string {
   let normalized = url.trim()
-  // Default to https:// if no protocol specified.
-  if (normalized && !/^https?:\/\//i.test(normalized)) {
+  // Default to https:// only when no scheme is present at all. A URL that already carries a
+  // scheme (including a vendor's own, such as proposal://workspace) must pass through unchanged:
+  // prepending https:// to it produces https://proposal://workspace, which matches no resource.
+  if (normalized && !/^[a-z][a-z0-9+.-]*:\/\//i.test(normalized)) {
     normalized = 'https://' + normalized
   }
   // Strip trailing /* wildcard — it's not meaningful for the backend.
