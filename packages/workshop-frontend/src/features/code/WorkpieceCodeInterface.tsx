@@ -94,6 +94,10 @@ interface WorkpieceCodeInterfaceProps {
   // The file the agent is currently streaming edits into, if it is in this workpiece.
   streamingActiveFile?: string | null
   isAgentActive: boolean
+  // The selected workpiece is operated, not edited here (WorkpieceSummary.operateOnly): its code
+  // comes from its blueprint, and no chat can propose changes to it. The view stays read-only and
+  // says so.
+  operateOnly?: boolean
   isVisible?: boolean
   onHasCodeChange?: (hasCode: boolean) => void
 }
@@ -210,7 +214,7 @@ function replaceSpanTextChange(
 export default function WorkpieceCodeInterface({
   overseer, summary, height = '100%', selectedChatId = null, chatChanges,
   liveRows, liveEditPreviews, pendingGadgetIds, streamingActiveFile, isAgentActive,
-  isVisible = true, onHasCodeChange,
+  operateOnly = false, isVisible = true, onHasCodeChange,
 }: WorkpieceCodeInterfaceProps) {
   const toasts = useKumoToastManager()
   const toastsRef = useRef(toasts)
@@ -1040,9 +1044,10 @@ export default function WorkpieceCodeInterface({
   // ---- editing -----------------------------------------------------------------------------
 
   // Editing is locked outside a chat (committed code only changes through a chat's accept),
-  // while an agent turn is active (its edits stream into the same file), and until the chat's
-  // content has loaded.
-  const isEditingLocked = !branchMode || isAgentActive || !clientReady
+  // while an agent turn is active (its edits stream into the same file), until the chat's
+  // content has loaded, and always for an operated gadget (nothing here may propose changes to
+  // it; the banner below says so).
+  const isEditingLocked = operateOnly || !branchMode || isAgentActive || !clientReady
 
   // Apply whole-file operations (create / delete / rename) as local changes. `set` and `remove`
   // need no base text; the seeding call matters for an unpinned gadget, which it makes part of
@@ -1352,7 +1357,7 @@ export default function WorkpieceCodeInterface({
   const activeFileError = (activeResolved === undefined ? activeBaseError : null) ??
     (activeReviewLoading ? reviewError : null)
   const activeFileDownloadable = activeFileText !== null
-  const activeFileModeLabel = !branchMode
+  const activeFileModeLabel = !branchMode || operateOnly
     ? 'Viewing'
     : isEditingLocked
       ? 'Reviewing changes in'
@@ -1360,6 +1365,11 @@ export default function WorkpieceCodeInterface({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height, width: '100%' }}>
+      {operateOnly && (
+        <div className="bg-kumo-tint border-b border-kumo-line px-4 py-2 text-sm text-kumo-subtle">
+          This app is operated, not edited here. Its code comes from its blueprint.
+        </div>
+      )}
       {hasUnsavedChanges && (
         <div className="bg-kumo-tint border-b border-kumo-line px-4 py-2 flex items-center gap-2 text-sm text-kumo-warning">
           <span className="text-base">&#9888;&#65039;</span>
