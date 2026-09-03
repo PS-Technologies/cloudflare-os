@@ -268,3 +268,43 @@ describe("getGadgetFacetFetcher", () => {
     expect(await countAborts(true)).toBe(1);
   });
 });
+
+describe("loadGadgetWorker", () => {
+  // The loader caches whatever the load callback returns under the code-version key, so a load
+  // that came up with no server.js stayed dead until a binding rename moved the key (live,
+  // 2026-09-03). The callback must fail instead of handing the loader an empty worker.
+  async function loadWith(files: Record<string, string>): Promise<Record<string, string>> {
+    let modules: Record<string, string> | undefined;
+    await withOverseer(async (_instance, impl) => {
+      impl.storage.gadgets.put({
+        type: "gadget", id: 1, title: "Proposal", created: new Date(0), bindingName: "PROPOSAL",
+        bindings: {}, commitId: "a".repeat(40),
+      });
+      let realEnv = impl.env;
+      let realGitStore = impl.gitStore;
+      // LOADER runs the callback and hands back its config; gitStore serves the files.
+      impl.env = {
+        ...realEnv,
+        LOADER: { get: (_key: string, load: () => Promise<{ modules: Record<string, string> }>) => load() },
+      };
+      impl.gitStore = { readCommitFiles: async () => new Map(Object.entries(files)) };
+      try {
+        modules = (await impl.loadGadgetWorker(1)).modules;
+      } finally {
+        impl.env = realEnv;
+        impl.gitStore = realGitStore;
+      }
+    });
+    return modules!;
+  }
+
+  it("refuses to hand the loader a worker with no server.js", async () => {
+    await expect(loadWith({ "README.md": "# Proposal", "client.js": "" })).rejects.toThrow(
+        "Gadget 1 has no server.js to load (files: 2); refusing to cache an empty load.");
+  });
+
+  it("loads the .js modules when server.js is present", async () => {
+    expect(await loadWith({ "server.js": "export default {}", "client.js": "", "README.md": "#" }))
+        .toEqual({ "server.js": "export default {}", "client.js": "" });
+  });
+});

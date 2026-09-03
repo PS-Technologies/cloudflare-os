@@ -5,12 +5,14 @@ import { createTracer } from "@gadgets/backend-utils/tracing";
 export type WorkshopObservabilityFields = {
   accountId: number;
   actionId: number | string;
+  attempt: number;
   autoProvisioned: boolean;
   blueprintId: string;
   callbackInitiated: boolean;
   chatId: number;
   claimedType: string;
   commitCount: number;
+  delayMs: number;
   durableObjectId: string;
   durationMs: number;
   eventName: string;
@@ -20,6 +22,7 @@ export type WorkshopObservabilityFields = {
   gatekeeperId: number | string;
   hookId: number;
   logBytes: number;
+  maxAttempts: number;
   modelId: string;
   observerId: string;
   oidCount: number;
