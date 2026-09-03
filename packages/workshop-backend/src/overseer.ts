@@ -4064,6 +4064,15 @@ class OverseerImpl implements AgentHooks {
         }
       }
 
+      // The loader caches whatever this callback returns under the cache key above, and a worker
+      // with no main module fails every request until the key moves (a merge, or a binding
+      // rename). Seen live on 2026-09-03: a fresh gadget's first load came up empty and stayed
+      // dead until someone renamed a binding. Fail the load instead, so the next call retries.
+      if (!Object.hasOwn(modules, "server.js")) {
+        throw new Error(`Gadget ${gadgetId} has no server.js to load (files: ${files.size}); ` +
+            "refusing to cache an empty load.");
+      }
+
       let tailProps: GadgetTailLoopbackProps = {
         chatId,
         gadgetId,
