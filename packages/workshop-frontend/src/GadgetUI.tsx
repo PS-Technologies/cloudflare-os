@@ -505,7 +505,7 @@ function GadgetUISession({ gadget, height, reloadTrigger, isVisible = true, chat
           height: '100%',
           border: 'none'
         }}
-        sandbox="allow-scripts allow-pointer-lock allow-popups allow-popups-to-escape-sandbox"
+        sandbox="allow-scripts allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-downloads"
         title="Gadget UI"
       />
     </div>
