@@ -35,7 +35,7 @@ import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminC
 import { chatChangeStatuses, foldProposedChanges, isCompactionTurn,
   type ChangeBatch } from "./agent-compaction";
 import { ambientGatekeeperMode } from "./provisioning-policy";
-import { listFeaturedBlueprintsFromKv, readBlueprintContent, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive";
+import { blueprintOperateOnly, listFeaturedBlueprintsFromKv, readBlueprintContent, readBlueprintKvRecord, sanitizeBlueprintOutput } from "./blueprint-archive";
 import { WebFetchEnv } from "./web-fetch";
 import { UserDurableObject, UserAiModelRecord, type UserChatContext, type WorkspaceOutputEntry } from "./user";
 import { AgentSpawnerBinding } from "./agent-spawner-binding";
@@ -68,6 +68,15 @@ import {
 
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
+
+/**
+ * What a chat agent is told when it tries to record a code change against an operated gadget (see
+ * GadgetRecord.operateOnly). It names the alternative, because the right next move is an RPC call
+ * rather than a retry.
+ */
+export const OPERATED_GADGET_EDIT_ERROR =
+    "This gadget is operated, not edited here. Use its RPC methods (call them from executeCode; " +
+    "read its README.md or server.js to learn them).";
 
 let CODE_MODE_HARNESS =
 `import { WorkerEntrypoint, restore } from "cloudflare:workers";
@@ -333,6 +342,18 @@ type GadgetRecord = {
   // a generic app. Purely descriptive: it names and draws the gadget, and confers nothing.
   output?: BlueprintOutput;
 
+  // This gadget is *operated*, not edited here: copied from the blueprint it was instantiated from
+  // (see BlueprintMetadata.operateOnly), which is the only way it is ever set. Two consequences,
+  // and nothing else:
+  //   - The agent's file-writing tools refuse it (see assertGadgetEditable), so no chat can record
+  //     a code change against it.
+  //   - Its facet always runs the main version once it has one (see gadgetFacetChatId), so callers
+  //     in different chats -- the app view, a room agent, a spawned specialist -- can never
+  //     ping-pong the facet between the main and a chat-proposed version, aborting it each time.
+  // Absent (the default, and the state of every gadget that existed before this field) means an
+  // ordinary gadget, behaving exactly as before.
+  operateOnly?: true;
+
   // Name of the gadget to use in the workspace's default binding list for new chats. That is, when
   // a new (normal, non-spawner) chat is started, this gadget will be available in its `env` under
   // this name from the start. The name is typically chosen at creation time (an argument to the
@@ -375,6 +396,27 @@ type GadgetRecord = {
   // it so the gadget is fully functional (bindings, facet, env) before acceptance.
   pending?: {chatId: number, sequence?: number};
 };
+
+/**
+ * Which chat's proposed changes a load of the given gadget should run; `undefined` means the main
+ * (committed) version. Three rules, in order:
+ *   - Out of chat context there is nothing proposed: main.
+ *   - An operated gadget that has a head never runs chat-proposed code (see
+ *     GadgetRecord.operateOnly). Every caller therefore resolves to the same version, so callers
+ *     in different chats -- the app view, a room agent, a spawned specialist calling back -- can
+ *     no longer abort the facet out from under each other to switch versions. A still-*pending*
+ *     operated gadget has no main version yet: its files exist only in its creating chat's
+ *     proposed changes, so that chat's version is the only one there is.
+ *   - Otherwise a chat with no proposed changes is the main version too.
+ */
+export function gadgetFacetChatId(
+    record: Pick<GadgetRecord, "operateOnly" | "commitId">,
+    chatId: number | undefined,
+    meta: Pick<AiChatMetadata, "hasProposedChanges"> | undefined): number | undefined {
+  if (chatId === undefined) return undefined;
+  if (record.operateOnly && record.commitId !== undefined) return undefined;
+  return meta?.hasProposedChanges ? chatId : undefined;
+}
 
 // Produce a valid, unused binding name from a suggested base name: sanitized to identifier
 // characters (uppercased, in keeping with the ALL_CAPS convention), then suffixed _2/_3/...
@@ -2030,6 +2072,15 @@ class OverseerImpl implements AgentHooks {
     return {workpieceId: id};
   }
 
+  // AgentHooks implementation: refuse a chat agent's code change to an operated gadget (see
+  // GadgetRecord.operateOnly). Reads are deliberately untouched -- the agent has to read the
+  // gadget's README.md/server.js to learn the RPC methods this error points it at.
+  assertGadgetEditable(gadgetId: WorkpieceId): void {
+    if (this.storage.gadgets.get(gadgetId)?.operateOnly) {
+      throw new Error(OPERATED_GADGET_EDIT_ERROR);
+    }
+  }
+
   // Create a new gadget workpiece with the given title and binding name, no files, and no
   // bindings. The title is trimmed and must be non-empty (there are no default gadget titles;
   // every creation path names its gadget). The binding name must be valid (see
@@ -2039,10 +2090,11 @@ class OverseerImpl implements AgentHooks {
   // getting its creation recorded in the chat log so the pending record gets sequence-stamped
   // (see addChatMessages()). Otherwise the gadget is permanent and `initialCommitId` -- its
   // empty-tree initial commit, written by the caller beforehand -- is required: every permanent
-  // gadget is born with a head (see GadgetRecord.commitId). `output` is the format declared by
-  // the blueprint being instantiated, if any.
+  // gadget is born with a head (see GadgetRecord.commitId). `output` and `operateOnly` are the
+  // declarations of the blueprint being instantiated, if any.
   createGadget(title: string, bindingName: string, chatId?: number,
-               output?: BlueprintOutput, initialCommitId?: string): GadgetRecord {
+               output?: BlueprintOutput, operateOnly?: true,
+               initialCommitId?: string): GadgetRecord {
     title = title.trim();
     if (!title) {
       throw new Error("A gadget requires a non-empty title.");
@@ -2068,6 +2120,9 @@ class OverseerImpl implements AgentHooks {
     };
     if (output) {
       record.output = output;
+    }
+    if (operateOnly) {
+      record.operateOnly = true;
     }
     if (chatId !== undefined) {
       record.pending = {chatId};
@@ -2319,6 +2374,9 @@ class OverseerImpl implements AgentHooks {
       }
       if (record.output) {
         summary.output = record.output;
+      }
+      if (record.operateOnly) {
+        summary.operateOnly = true;
       }
       if (record.pending) {
         summary.chatId = record.pending.chatId;
@@ -4035,16 +4093,14 @@ class OverseerImpl implements AgentHooks {
   // If `chatId` is specified, load the gadget including changes proposed in the given chat
   // thread.
   getGadgetFacetFetcher(gadgetId: WorkpieceId, chatId?: number): Fetcher<DurableObject> {
-    this.getGadgetRecord(gadgetId);  // validate it exists
+    let record = this.getGadgetRecord(gadgetId);  // validate it exists
 
-    if (chatId !== undefined) {
-      // Check if the requested chat has proposed changes. If not, then we don't want to load the
-      // chat-specific facet, we just want to load the main-branch facet.
-      let meta = this.storage.chatMeta.get(chatId);
-      if (!meta?.hasProposedChanges) {
-        chatId = undefined;
-      }
-    }
+    // Decide which version to run. A chat with no proposed changes wants the main-branch facet,
+    // not a chat-specific one; an operated gadget always wants the main-branch facet (see
+    // gadgetFacetChatId, which is the whole rule).
+    chatId = gadgetFacetChatId(
+        record, chatId,
+        chatId !== undefined ? this.storage.chatMeta.get(chatId) : undefined);
 
     // If we switched chats since the last time we ran the gadget and either the old or new chat
     // has proposed changes, this means we're changing what code is running, so we need to reset
@@ -6161,6 +6217,7 @@ class OverseerImpl implements AgentHooks {
       title: gadget.title,
       isDefault: gadget.id === this.defaultGadgetId,
       output: gadget.output,
+      operateOnly: gadget.operateOnly,
       bindings: this.visibleBindings(gadget, forChatId).map(([name, edge]) => ({
         name,
         title: this.storage.gatekeepers.get(edge.target)?.resourceTitle || "(title unavailable)",
@@ -7643,7 +7700,8 @@ class OverseerImpl implements AgentHooks {
   // by the agent's createGadget tool. Blueprint ids are bearer capabilities (like blueprint share
   // links), so possession of the id is sufficient to read it. Throws agent-readable errors.
   async fetchBlueprint(blueprintId: string)
-      : Promise<{files: Record<string, string>, notes: string, output?: BlueprintOutput}> {
+      : Promise<{files: Record<string, string>, notes: string, output?: BlueprintOutput,
+                 operateOnly?: true}> {
     let kvRecord = await readBlueprintKvRecord(this.env, blueprintId);
     if (!kvRecord) {
       throw new Error(`No such blueprint: ${blueprintId}. Use listBlueprints to see available ` +
@@ -7669,11 +7727,20 @@ class OverseerImpl implements AgentHooks {
     let output = deploymentOutputForBlueprint(await readAdminConfig(this.env), blueprintId,
         sanitizeBlueprintOutput(kvRecord.metadata.output));
 
+    // Declared by the blueprint's author: the new gadget is operated, not edited here (see
+    // GadgetRecord.operateOnly).
+    let operateOnly = blueprintOperateOnly(kvRecord.metadata);
+
     let lines = [`Created the new gadget from blueprint ` +
         `${JSON.stringify(kvRecord.metadata.title)} (blueprintId ${blueprintId}).`];
     if (output) {
       lines.push(`It produces a ${output.noun}; the new gadget is labelled as one throughout the ` +
           `UI.`);
+    }
+    if (operateOnly) {
+      lines.push(`This gadget is operated, not edited here: its code comes from its blueprint and ` +
+          `the file tools will refuse it. Drive it through its RPC methods instead (read its ` +
+          `README.md or server.js to learn them).`);
     }
 
     let filenames = Object.keys(files);
@@ -7717,7 +7784,7 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
-    return {files, notes: lines.join("\n"), output};
+    return {files, notes: lines.join("\n"), output, operateOnly};
   }
 
   // Wire a blueprint's connections onto a chat-created gadget, acting as the turn's initiator:
@@ -8700,8 +8767,8 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
    * Initialize this workspace's default gadget from a blueprint's code snapshot. Called by
    * AuthenticatedApi.newGadgetFromBlueprint() after creating (and opening) the DO.
    */
-  async initializeFromBlueprint(code: Uint8Array, title: string, output?: BlueprintOutput)
-      : Promise<void> {
+  async initializeFromBlueprint(code: Uint8Array, title: string, output?: BlueprintOutput,
+                                operateOnly?: true): Promise<void> {
     // Set the title. The default gadget (created below) inherits it.
     this.impl.storage.title.put(title);
 
@@ -8744,10 +8811,12 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     this.impl.ensureDefaultGadget(commitId);
 
     // The gadget inherits the blueprint's declared format, so it is named and drawn as a Document
-    // (or whatever it produces) rather than a generic app.
-    if (output) {
+    // (or whatever it produces) rather than a generic app, and its declared operate-only bit, so
+    // this path and chat createGadget produce the same gadget (see GadgetRecord.operateOnly).
+    if (output || operateOnly) {
       let record = this.impl.getGadgetRecord(this.impl.resolveGadgetId(undefined));
-      record.output = output;
+      if (output) record.output = output;
+      if (operateOnly) record.operateOnly = true;
       this.impl.storage.gadgets.put(record);
     }
 
@@ -9429,7 +9498,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
         timestamp: new Date(),
       });
       // (createGadget validates the title and name.)
-      record = this.impl.createGadget(title, bindingName, undefined, undefined, initialCommitId);
+      record = this.impl.createGadget(
+          title, bindingName, undefined, undefined, undefined, initialCommitId);
     } else {
       // Creating a gadget with a chat open is provisional to that chat, like code edits: record
       // the creation in the chat log as a "changes" message (with no code update) and mark
@@ -11191,9 +11261,13 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     };
 
     // Republishing preserves the format: a blueprint made from a Document still produces
-    // Documents.
+    // Documents. It preserves the operate-only bit for the same reason -- a blueprint made from
+    // an operated gadget still produces operated gadgets (see GadgetRecord.operateOnly).
     if (gadget.output) {
       metadata.output = gadget.output;
+    }
+    if (gadget.operateOnly) {
+      metadata.operateOnly = true;
     }
 
     let record: BlueprintGadgetRecord = {

@@ -64,6 +64,10 @@ interface GadgetCodeInterfaceProps {
   // The file the agent is currently streaming edits into, if it is in this workpiece.
   streamingActiveFile?: string | null
   isAgentActive: boolean
+  // The selected workpiece is operated, not edited here (WorkpieceSummary.operateOnly): its code
+  // comes from its blueprint, and no chat can propose changes to it. The view stays read-only and
+  // says so.
+  operateOnly?: boolean
   isVisible?: boolean
   onHasCodeChange?: (hasCode: boolean) => void
 }
@@ -171,7 +175,7 @@ function replaceSpanTextChange(
 export default function GadgetCodeInterface({
   overseer, workpieceId, headCommitId, height = '100%', selectedChatId = null, chatChanges,
   liveRows, liveEditPreviews, pendingGadgetIds, streamingActiveFile, isAgentActive,
-  isVisible = true, onHasCodeChange,
+  operateOnly = false, isVisible = true, onHasCodeChange,
 }: GadgetCodeInterfaceProps) {
   const toasts = useKumoToastManager()
   const toastsRef = useRef(toasts)
@@ -842,9 +846,10 @@ export default function GadgetCodeInterface({
   // ---- editing -----------------------------------------------------------------------------
 
   // Editing is locked outside a chat (committed code only changes through a chat's accept),
-  // while an agent turn is active (its edits stream into the same file), and until the chat's
-  // content has loaded.
-  const isEditingLocked = !branchMode || isAgentActive || !clientReady
+  // while an agent turn is active (its edits stream into the same file), until the chat's
+  // content has loaded, and always for an operated gadget (nothing here may propose changes to
+  // it; the banner below says so).
+  const isEditingLocked = operateOnly || !branchMode || isAgentActive || !clientReady
 
   // Make the selected gadget part of the chat's content if it isn't yet: the first local edit
   // to an unpinned gadget pins it at the head tree the user is looking at.
@@ -1074,7 +1079,7 @@ export default function GadgetCodeInterface({
     : null
   const activeFileDownloadable =
     activeFile !== null && displayFiles?.get(activeFile) !== undefined
-  const activeFileModeLabel = !branchMode
+  const activeFileModeLabel = !branchMode || operateOnly
     ? 'Viewing'
     : isEditingLocked
       ? 'Reviewing changes in'
@@ -1082,6 +1087,11 @@ export default function GadgetCodeInterface({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height, width: '100%' }}>
+      {operateOnly && (
+        <div className="bg-kumo-tint border-b border-kumo-line px-4 py-2 text-sm text-kumo-subtle">
+          This app is operated, not edited here. Its code comes from its blueprint.
+        </div>
+      )}
       {hasUnsavedChanges && (
         <div className="bg-kumo-tint border-b border-kumo-line px-4 py-2 flex items-center gap-2 text-sm text-kumo-warning">
           <span className="text-base">&#9888;&#65039;</span>

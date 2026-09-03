@@ -255,6 +255,12 @@ export type AgentGadgetInfo = {
   bindings: {name: string, title: string, target: WorkpieceId}[];
   /** What instantiating this gadget's blueprint produces, when it came from one that declares it. */
   output?: BlueprintOutput;
+  /**
+   * This gadget is operated, not edited here (see GadgetRecord.operateOnly in overseer.ts): the
+   * file-writing tools refuse it, so the prompt says so rather than letting the model discover it
+   * by getting an error.
+   */
+  operateOnly?: true;
 };
 
 // Resolves a `describeBinding` tool argument (a name in the chat's env) to its human-readable
@@ -415,14 +421,23 @@ export interface AgentHooks {
       : {workpieceId: WorkpieceId};
 
   /**
+   * Throw an agent-readable error if the gadget is operated rather than edited here (see
+   * GadgetRecord.operateOnly in overseer.ts). Called by every tool that would record a code change
+   * against a gadget, right after resolveWorkpieceRoot. Reads are unaffected.
+   */
+  assertGadgetEditable(gadgetId: WorkpieceId): void;
+
+  /**
    * Create a new, empty gadget workpiece with the given title and binding name, provisional to
    * the given chat: it becomes permanent only when the user accepts the chat's changes through
    * the "changes" message that records the creation (see GadgetRecord.pending in overseer.ts).
    * Throws if the binding name is invalid or already claimed by another gadget (including one
    * still pending in another chat). Returns the id and the (trimmed) title as created. `output`
-   * is the format declared by the blueprint being instantiated, if any (see fetchBlueprint).
+   * and `operateOnly` are the declarations of the blueprint being instantiated, if any (see
+   * fetchBlueprint).
    */
-  createGadget(title: string, bindingName: string, chatId: number, output?: BlueprintOutput)
+  createGadget(title: string, bindingName: string, chatId: number, output?: BlueprintOutput,
+               operateOnly?: true)
       : {id: WorkpieceId, title: string};
 
   /**
@@ -557,7 +572,8 @@ export interface AgentHooks {
    * doesn't exist.
    */
   fetchBlueprint(blueprintId: string)
-      : Promise<{files: Record<string, string>, notes: string, output?: BlueprintOutput}>;
+      : Promise<{files: Record<string, string>, notes: string, output?: BlueprintOutput,
+                 operateOnly?: true}>;
 
   /**
    * After createGadget has minted a gadget from a blueprint's code, wire that blueprint's
@@ -2158,6 +2174,17 @@ export async function runAgent(
               `edit its code to change its content. Edit the code only if the user asks to change ` +
               `how the ${info.output.noun} itself works (its editor, layout, or features).`);
         }
+        if (info.operateOnly) {
+          // Not advice, unlike the `output` note above: the file-writing tools genuinely refuse
+          // this gadget (see assertGadgetEditable), so say so before the model tries.
+          lines.push(
+              `This gadget is operated, not edited here: writeFile and editFile will refuse it. ` +
+              `Its code comes from its blueprint and changes only where that blueprint is ` +
+              `maintained. Drive it through its RPC methods from \`executeCode\`` +
+              (envName !== undefined ? ` (\`env.${envName}\`)` : ``) +
+              `; readFile still works, so read its README.md or server.js to learn the methods it ` +
+              `offers.`);
+        }
         if (info.bindings.length == 0) {
           lines.push(`This gadget has no bindings.`);
         } else {
@@ -2373,6 +2400,7 @@ export async function runAgent(
         try {
           let resolved =
               hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
+          hooks.assertGadgetEditable(resolved.workpieceId);
 
           // The first write to an unpinned gadget with committed code pins it at the current
           // head (a whole-file overwrite is coherent against any base, so no read gate here).
@@ -2426,6 +2454,7 @@ export async function runAgent(
         try {
           let resolved =
               hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
+          hooks.assertGadgetEditable(resolved.workpieceId);
           let readFiles = filesRead.get(resolved.workpieceId);
           if (readFiles === undefined || !readFiles.has(filename)) {
             throw new Error("You must read a file before you can edit it.");
@@ -2668,7 +2697,8 @@ export async function runAgent(
             emitStreamEvent({type: "toolCallOutputFormat", toolCallId, output: blueprint.output});
           }
 
-          let created = hooks.createGadget(title, bindingName, chatId, blueprint?.output);
+          let created = hooks.createGadget(
+              title, bindingName, chatId, blueprint?.output, blueprint?.operateOnly);
           pendingCreatedGadgets.push({gadgetId: created.id, title: created.title, bindingName});
           chatBindings.set(bindingName, {type: "workpiece", id: created.id});
 
