@@ -59,6 +59,17 @@ export function sanitizeBlueprintOutput(output: unknown): BlueprintOutput | unde
   return {id: cleanId, noun: cleanNoun, plural: cleanPlural, icon};
 }
 
+/**
+ * Whether a blueprint declares that its gadgets are operated rather than edited (see
+ * BlueprintMetadata.operateOnly). Blueprint metadata arrives from uploaded archives and is stored
+ * verbatim, so the declaration is read strictly: anything but a literal `true` means an ordinary
+ * gadget. The flag only ever restricts, so a malformed one degrading to `false` is the safe way
+ * round -- it just leaves the gadget editable, exactly as today.
+ */
+export function blueprintOperateOnly(metadata: {operateOnly?: unknown}): true | undefined {
+  return metadata.operateOnly === true ? true : undefined;
+}
+
 type BlueprintContentEnv = Pick<Cloudflare.Env, 'BLUEPRINT_CONTENT'>;
 
 /** The BLUEPRINT_CONTENT key of the content that `metadata` describes. */
