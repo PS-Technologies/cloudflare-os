@@ -347,9 +347,10 @@ type GadgetRecord = {
   // and nothing else:
   //   - The agent's file-writing tools refuse it (see assertGadgetEditable), so no chat can record
   //     a code change against it.
-  //   - Its facet always runs the main version once it has one (see gadgetFacetChatId), so callers
-  //     in different chats -- the app view, a room agent, a spawned specialist -- can never
-  //     ping-pong the facet between the main and a chat-proposed version, aborting it each time.
+  //   - Its facet always runs one version for every caller (see gadgetFacetChatId): the creating
+  //     chat's while the gadget is pending, the main version once it has one. Callers in different
+  //     chats -- the app view, a room agent, a spawned specialist -- can therefore never ping-pong
+  //     the facet between versions, aborting it each time, nor load a version that has no files.
   // Absent (the default, and the state of every gadget that existed before this field) means an
   // ordinary gadget, behaving exactly as before.
   operateOnly?: true;
@@ -399,22 +400,28 @@ type GadgetRecord = {
 
 /**
  * Which chat's proposed changes a load of the given gadget should run; `undefined` means the main
- * (committed) version. Three rules, in order:
+ * (committed) version. Four rules, in order:
+ *   - An operated gadget (see GadgetRecord.operateOnly) has exactly one version, and every caller
+ *     runs it, so callers in different chats -- the app view, a room agent, a spawned specialist
+ *     calling back -- can never abort the facet out from under each other to switch versions.
+ *     While the gadget is still *pending* that version is its creating chat's: its files exist
+ *     only in that chat's proposed changes (there is no head to fall back to), so a caller from
+ *     outside the chat -- a specialist the gadget spawned, the app view -- resolves to the
+ *     creating chat too. Seen live on 2026-09-03: the specialist's own chat has nothing proposed,
+ *     so it loaded the absent main version and every call failed until the creation was accepted.
+ *   - Once the operated gadget has a head it never runs chat-proposed code: main.
  *   - Out of chat context there is nothing proposed: main.
- *   - An operated gadget that has a head never runs chat-proposed code (see
- *     GadgetRecord.operateOnly). Every caller therefore resolves to the same version, so callers
- *     in different chats -- the app view, a room agent, a spawned specialist calling back -- can
- *     no longer abort the facet out from under each other to switch versions. A still-*pending*
- *     operated gadget has no main version yet: its files exist only in its creating chat's
- *     proposed changes, so that chat's version is the only one there is.
  *   - Otherwise a chat with no proposed changes is the main version too.
  */
 export function gadgetFacetChatId(
-    record: Pick<GadgetRecord, "operateOnly" | "commitId">,
+    record: Pick<GadgetRecord, "operateOnly" | "commitId" | "pending">,
     chatId: number | undefined,
     meta: Pick<AiChatMetadata, "hasProposedChanges"> | undefined): number | undefined {
+  if (record.operateOnly) {
+    if (record.commitId === undefined && record.pending !== undefined) return record.pending.chatId;
+    if (record.commitId !== undefined) return undefined;
+  }
   if (chatId === undefined) return undefined;
-  if (record.operateOnly && record.commitId !== undefined) return undefined;
   return meta?.hasProposedChanges ? chatId : undefined;
 }
 
@@ -4105,8 +4112,15 @@ class OverseerImpl implements AgentHooks {
     let record = this.getGadgetRecord(gadgetId);  // validate it exists
 
     // Decide which version to run. A chat with no proposed changes wants the main-branch facet,
-    // not a chat-specific one; an operated gadget always wants the main-branch facet (see
-    // gadgetFacetChatId, which is the whole rule).
+    // not a chat-specific one; an operated gadget always wants its one version -- main, or the
+    // creating chat's while it is pending (see gadgetFacetChatId, which is the whole rule).
+    //
+    // No materialize step is needed for the pending case: a chat-created gadget's files arrive
+    // through the agent's step barrier (commitAgentStep), which appends the rows and materializes
+    // them into the step's "changes" message in one transaction, so buildChatContent as-of the
+    // creating chat's next sequence (see loadGadgetWorker) already holds them. Materializing
+    // here would also be wrong: the creating chat's turn is usually still running, and only the
+    // barrier may materialize during a turn.
     chatId = gadgetFacetChatId(
         record, chatId,
         chatId !== undefined ? this.storage.chatMeta.get(chatId) : undefined);

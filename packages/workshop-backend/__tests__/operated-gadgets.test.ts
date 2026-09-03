@@ -217,6 +217,44 @@ describe("gadgetFacetChatId", () => {
     // A pending gadget's files exist only in its creating chat's proposed changes.
     expect(gadgetFacetChatId({ operateOnly: true }, 3, PROPOSING)).toBe(3);
   });
+
+  describe("a pending operated gadget (no head, created in chat 3)", () => {
+    // Live, 2026-09-03: the gadget spawned a specialist the moment it was created. The
+    // specialist's chat had nothing proposed, so it resolved to main, which does not exist yet,
+    // and every call failed with "Gadget 9 has no server.js to load (files: 0)" until Accept.
+    const PENDING_OPERATED = { operateOnly: true as const, pending: { chatId: 3 } };
+
+    it("resolves the creating chat itself to its own version", () => {
+      expect(gadgetFacetChatId(PENDING_OPERATED, 3, PROPOSING)).toBe(3);
+    });
+
+    it("resolves a caller outside any chat to the creating chat", () => {
+      expect(gadgetFacetChatId(PENDING_OPERATED, undefined, undefined)).toBe(3);
+    });
+
+    it("resolves a caller in another chat to the creating chat, proposed changes or not", () => {
+      expect(gadgetFacetChatId(PENDING_OPERATED, 9, undefined)).toBe(3);
+      expect(gadgetFacetChatId(PENDING_OPERATED, 9, { hasProposedChanges: false })).toBe(3);
+      expect(gadgetFacetChatId(PENDING_OPERATED, 9, PROPOSING)).toBe(3);
+    });
+
+    it("goes back to main once the creation is accepted", () => {
+      // Accept writes the head and clears `pending` in one step; a record with both (a head and
+      // a lingering pending stamp) is main too, since the head is what a permanent gadget runs.
+      expect(gadgetFacetChatId({ operateOnly: true, commitId: "a".repeat(40) }, 9, PROPOSING))
+          .toBeUndefined();
+      expect(gadgetFacetChatId({ ...PENDING_OPERATED, commitId: "a".repeat(40) }, undefined,
+                               undefined)).toBeUndefined();
+    });
+  });
+
+  it("leaves a pending ordinary gadget on the old per-caller rule", () => {
+    const PENDING = { pending: { chatId: 3 } };
+    expect(gadgetFacetChatId(PENDING, undefined, undefined)).toBeUndefined();
+    expect(gadgetFacetChatId(PENDING, 3, PROPOSING)).toBe(3);
+    expect(gadgetFacetChatId(PENDING, 9, PROPOSING)).toBe(9);
+    expect(gadgetFacetChatId(PENDING, 9, { hasProposedChanges: false })).toBeUndefined();
+  });
 });
 
 describe("getGadgetFacetFetcher", () => {
@@ -224,12 +262,13 @@ describe("getGadgetFacetFetcher", () => {
   // then a spawned specialist calling back through the app view again.
   const CALLERS: (number | undefined)[] = [1, undefined, 1, undefined];
 
-  async function countAborts(operateOnly: boolean): Promise<number> {
+  async function countAborts(operateOnly: boolean, record: Record<string, unknown> =
+      { commitId: "a".repeat(40) }, callers: (number | undefined)[] = CALLERS): Promise<number> {
     let aborts: string[] = [];
     await withOverseer(async (_instance, impl) => {
       impl.storage.gadgets.put({
         id: 1, title: "Proposal", created: new Date(0), bindingName: "PROPOSAL",
-        bindings: {}, commitId: "a".repeat(40),
+        bindings: {}, ...record,
         ...(operateOnly ? { operateOnly: true } : {}),
       });
       impl.storage.chatMeta.put({
@@ -250,7 +289,7 @@ describe("getGadgetFacetFetcher", () => {
         },
       };
       try {
-        for (let chatId of CALLERS) impl.getGadgetFacetFetcher(1, chatId);
+        for (let chatId of callers) impl.getGadgetFacetFetcher(1, chatId);
       } finally {
         impl.ctx = realCtx;
       }
@@ -268,7 +307,33 @@ describe("getGadgetFacetFetcher", () => {
     // started), then nothing: every caller resolves to the same main version.
     expect(await countAborts(true)).toBe(1);
   });
+
+  it("never restarts a pending operated gadget's facet either", async () => {
+    // The creating chat, the app view, a spawned specialist's chat (nothing proposed there, not
+    // even a chat record yet), and the app view again: every caller resolves to the creating
+    // chat's version, so the one defensive reset is all there is. An ordinary pending gadget
+    // still swaps to main (which has no files) for the app view and stays there.
+    const PENDING = { pending: { chatId: 1 } };
+    const CALLERS_WITH_SPECIALIST = [1, undefined, 9, undefined];
+    expect(await countAborts(true, PENDING, CALLERS_WITH_SPECIALIST)).toBe(1);
+    expect(await countAborts(false, PENDING, CALLERS_WITH_SPECIALIST)).toBe(2);
+  });
 });
+
+// LOADER runs the callback and hands back its config, so the assembled modules are visible.
+async function loadModules(impl: any, gadgetId: number, chatId?: number)
+    : Promise<Record<string, string>> {
+  let realEnv = impl.env;
+  impl.env = {
+    ...realEnv,
+    LOADER: { get: (_key: string, load: () => Promise<{ modules: Record<string, string> }>) => load() },
+  };
+  try {
+    return (await impl.loadGadgetWorker(gadgetId, chatId)).modules;
+  } finally {
+    impl.env = realEnv;
+  }
+}
 
 describe("loadGadgetWorker", () => {
   // The loader caches whatever the load callback returns under the code-version key, so a load
@@ -281,23 +346,52 @@ describe("loadGadgetWorker", () => {
         id: 1, title: "Proposal", created: new Date(0), bindingName: "PROPOSAL",
         bindings: {}, commitId: "a".repeat(40),
       });
-      let realEnv = impl.env;
       let realGitStore = impl.gitStore;
-      // LOADER runs the callback and hands back its config; gitStore serves the files.
-      impl.env = {
-        ...realEnv,
-        LOADER: { get: (_key: string, load: () => Promise<{ modules: Record<string, string> }>) => load() },
-      };
+      // gitStore serves the files.
       impl.gitStore = { readCommitFiles: async () => new Map(Object.entries(files)) };
       try {
-        modules = (await impl.loadGadgetWorker(1)).modules;
+        modules = await loadModules(impl, 1);
       } finally {
-        impl.env = realEnv;
         impl.gitStore = realGitStore;
       }
     });
     return modules!;
   }
+
+  it("loads a pending operated gadget from its creating chat for a caller in another chat",
+      async () => {
+    // The chat createGadget path end to end: the record is minted mid-step, and the blueprint's
+    // files reach storage through the step barrier, which appends the rows and materializes them
+    // into the step's "changes" message in one transaction. So once the step is over, the
+    // as-of-next-sequence chat content the load reads already holds the files, with no
+    // materialize step of its own (which would be refused mid-turn anyway).
+    await withOverseer(async (_instance, impl) => {
+      impl.storage.chatMeta.put(
+          { id: 3, title: "Room", started: new Date(0), lastActive: new Date(0) });
+      impl.storage.chatMeta.put(
+          { id: 9, title: "Specialist", started: new Date(1), lastActive: new Date(1) });
+      let created = impl.createGadget("Proposal", "PROPOSAL", 3, undefined, true);
+      expect(await impl.commitAgentStep(3, { type: "agent", id: "some-model", name: "Agent" },
+          [{ type: "message", message: "made it" }], {
+        changes: [{ change: { [created.id]: [
+          ["server.js", { set: "export default {}" }], ["README.md", { set: "#" }]] } }],
+        createdGadgets: [{ gadgetId: created.id, title: "Proposal", bindingName: "PROPOSAL" }],
+        addedBindings: [],
+      })).toBe(true);
+
+      let record = impl.storage.gadgets.get(created.id);
+      expect(record.commitId).toBeUndefined();
+      expect(gadgetFacetChatId(record, 9, impl.storage.chatMeta.get(9))).toBe(3);
+      expect(gadgetFacetChatId(record, undefined, undefined)).toBe(3);
+
+      // What the facet would load for the specialist (and the app view): the creating chat's
+      // version, with the files in it.
+      expect(await loadModules(impl, created.id, 3)).toEqual({ "server.js": "export default {}" });
+      // What it loaded before this rule: main, which a pending gadget does not have.
+      await expect(loadModules(impl, created.id, undefined)).rejects.toThrow(
+          `Gadget ${created.id} has no server.js to load (files: 0)`);
+    });
+  });
 
   it("refuses to hand the loader a worker with no server.js", async () => {
     await expect(loadWith({ "README.md": "# Proposal", "client.js": "" })).rejects.toThrow(
