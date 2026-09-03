@@ -146,6 +146,9 @@ export type GadgetRecord = {
    */
   output?: BlueprintOutput;
 
+  /** Copied from BlueprintMetadata: chat may operate this gadget but may never edit it. */
+  operateOnly?: true;
+
   /**
    * Name of the gadget to use in the workspace's default binding list for new chats. That is, when
    * a new (normal, non-spawner) chat is started, this gadget will be available in its `env` under

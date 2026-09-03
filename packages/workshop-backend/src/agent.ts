@@ -188,6 +188,12 @@ export type AgentGadgetInfo = {
   bindings: {name: string, title: string, target: WorkpieceId}[];
   /** What instantiating this gadget's blueprint produces, when it came from one that declares it. */
   output?: BlueprintOutput;
+  /**
+   * This gadget is operated, not edited here (see GadgetRecord.operateOnly in overseer.ts): the
+   * file-writing tools refuse it, so the prompt says so rather than letting the model discover it
+   * by getting an error.
+   */
+  operateOnly?: true;
 };
 
 /**
@@ -366,6 +372,13 @@ export interface AgentHooks {
       : {workpieceId: WorkpieceId};
 
   /**
+   * Throw an agent-readable error if the gadget is operated rather than edited here (see
+   * GadgetRecord.operateOnly in overseer.ts). Called by every tool that would record a code change
+   * against a gadget, right after resolveWorkpieceRoot. Reads are unaffected.
+   */
+  assertGadgetEditable(gadgetId: WorkpieceId): void;
+
+  /**
    * Create a new, empty gadget workpiece with the given title and binding name, provisional to
    * the given chat: it becomes permanent only when the user accepts the chat's changes through
    * the "changes" message that records the creation (GadgetRecord.pending in overseer-storage.ts).
@@ -375,7 +388,7 @@ export interface AgentHooks {
    * (see fetchBlueprint). A gadget created from none is recorded as made from scratch.
    */
   createGadget(title: string, bindingName: string, chatId: number,
-               blueprint?: {output?: BlueprintOutput}): {id: WorkpieceId, title: string};
+               blueprint?: {output?: BlueprintOutput, operateOnly?: true}): {id: WorkpieceId, title: string};
 
   /**
    * Create a new worktree workpiece rooted at the given commit id (a full oid, resolved against
@@ -596,7 +609,7 @@ export interface AgentHooks {
    * exist.
    */
   fetchBlueprint(blueprintId: string): Promise<{
-    files: Record<string, string>, notes: string, output?: BlueprintOutput,
+    files: Record<string, string>, notes: string, output?: BlueprintOutput, operateOnly?: true,
     merge: Omit<BlueprintMerge, "gadgetId">,
     bindings: Record<string, BlueprintBinding>,
   }>;
@@ -2973,6 +2986,17 @@ async function runAgentPass(
               `edit its code to change its content. Edit the code only if the user asks to change ` +
               `how the ${info.output.noun} itself works (its editor, layout, or features).`);
         }
+        if (info.operateOnly) {
+          // Not advice, unlike the `output` note above: the file-writing tools genuinely refuse
+          // this gadget (see assertGadgetEditable), so say so before the model tries.
+          lines.push(
+              `This gadget is operated, not edited here: writeFile and editFile will refuse it. ` +
+              `Its code comes from its blueprint and changes only where that blueprint is ` +
+              `maintained. Drive it through its RPC methods from \`executeCode\`` +
+              (envName !== undefined ? ` (\`env.${envName}\`)` : ``) +
+              `; readFile still works, so read its README.md or server.js to learn the methods it ` +
+              `offers.`);
+        }
         if (info.bindings.length == 0) {
           lines.push(`This gadget has no bindings.`);
         } else {
@@ -3236,6 +3260,7 @@ async function runAgentPass(
           let resolved =
               hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
           assertMayModifyWorkpiece(resolved.workpieceId);
+          hooks.assertGadgetEditable(resolved.workpieceId);
 
           // Writing over a worktree's symlink or submodule entry is rejected with the same
           // descriptive error reading one gets, and a base *directory* path too -- such a
@@ -3306,6 +3331,7 @@ async function runAgentPass(
           let resolved =
               hooks.resolveWorkpieceRoot(resolveToolWorkpieceId(workpiece), true, chatId);
           assertMayModifyWorkpiece(resolved.workpieceId);
+          hooks.assertGadgetEditable(resolved.workpieceId);
           let readFiles = filesRead.get(resolved.workpieceId);
           if (readFiles === undefined || !readFiles.has(filename)) {
             // A file the agent never saw may not exist at all, usually a mistyped name.
