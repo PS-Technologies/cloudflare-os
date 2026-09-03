@@ -1,5 +1,10 @@
-import type { Message, Usage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessageEvent, type Message, type Usage }
+  from "@earendil-works/pi-ai";
+import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { ModelHandle } from "./ai-models.js";
+import { createWorkshopLogger } from "./observability.js";
+
+const logger = createWorkshopLogger("workshop.ai-invoke");
 
 /**
  * An all-zeros pi Usage record, for synthesizing assistant messages that were never actually
@@ -78,4 +83,88 @@ export async function completeText(handle: ModelHandle, args: {
       .filter(block => block.type === "text")
       .map(block => block.text)
       .join("");
+}
+
+/**
+ * Backoff between attempts at a model request the provider refused with HTTP 429. Three retries,
+ * so a turn waits at most 30s for a rate limit to clear before the error reaches the user.
+ */
+export const RATE_LIMIT_BACKOFF_MS: readonly number[] = [2000, 8000, 20000];
+
+/**
+ * Whether a failed request was a rate limit. pi reports the provider error as text only; the
+ * SDKs' messages begin with the status ("429 {...}"), and OpenAI's wholesale limit and
+ * Anthropic's both say "rate limit" somewhere in the body. `lastResponse` covers the case where
+ * a response arrived but the message does not lead with its status.
+ */
+export function isRateLimitError(errorMessage: string, handle: ModelHandle): boolean {
+  return httpStatusFromError(errorMessage, handle) === 429 ||
+      /\brate.?limit/i.test(errorMessage);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, ms);
+    const onAbort = () => { clearTimeout(timer); resolve(); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Wraps a handle's `stream` for the agent loop so a request the provider rate-limits (HTTP 429)
+ * is retried with RATE_LIMIT_BACKOFF_MS before the error surfaces as the turn's failure. Only a
+ * request that failed before producing any content is retried: once text, thinking or a tool call
+ * has streamed to the client, the failure is passed through as pi reports it. Each retry logs
+ * `agent.model.ratelimited`. `sleep` is injectable for tests.
+ */
+export function withRateLimitRetry(handle: ModelHandle, opts: {
+  chatId?: number;
+  backoffMs?: readonly number[];
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+} = {}): StreamFn {
+  const backoff = opts.backoffMs ?? RATE_LIMIT_BACKOFF_MS;
+  const wait = opts.sleep ?? sleep;
+  return (model, context, options) => {
+    const out = createAssistantMessageEventStream();
+    const signal = options?.signal;
+    void (async () => {
+      for (let attempt = 0; ; ++attempt) {
+        // Events before the first content are held back until the request either produces
+        // content (then they are forwarded and the stream passes through) or fails.
+        const held: AssistantMessageEvent[] = [];
+        let passthrough = false;
+        let retry = false;
+        for await (const event of await handle.stream(model, context, options)) {
+          if (passthrough) {
+            out.push(event);
+            continue;
+          }
+          if (event.type === "error" && attempt < backoff.length && !signal?.aborted &&
+              isRateLimitError(event.error.errorMessage ?? "", handle)) {
+            const delayMs = backoff[attempt];
+            logger.warn("model request rate limited; retrying", {
+              event: "agent.model.ratelimited", chatId: opts.chatId, attempt: attempt + 1,
+              maxAttempts: backoff.length, delayMs, modelId: model.id,
+              statusCode: httpStatusFromError(event.error.errorMessage ?? "", handle),
+            });
+            await wait(delayMs, signal);
+            // Cancelled while waiting: no retry; the failure is reported as pi produced it and
+            // the loop turns it into the abort reason.
+            retry = !signal?.aborted;
+            if (retry) break;
+          }
+          held.push(event);
+          if (event.type !== "start") {
+            passthrough = true;
+            for (const heldEvent of held) out.push(heldEvent);
+            held.length = 0;
+          }
+        }
+        if (retry) continue;
+        for (const heldEvent of held) out.push(heldEvent);
+        return;
+      }
+    })();
+    return out;
+  };
 }

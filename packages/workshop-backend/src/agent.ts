@@ -18,7 +18,9 @@ import { formatAlwaysAvailableResourcesPrompt } from "./agent-catalog";
 import { formatInstanceInstructions } from "./admin-config";
 import type { AiGatewayLogRoute } from "./ai-gateway";
 import type { SpawnCallableOptions } from "./agent-spawner-binding";
-import { AgentTurnError, completeText, httpStatusFromError, zeroUsage } from "./ai-invoke";
+import {
+  AgentTurnError, completeText, httpStatusFromError, withRateLimitRetry, zeroUsage,
+} from "./ai-invoke";
 import type { ModelHandle } from "./ai-models";
 import {
   buildCompactionState, buildSummaryPrompt, chatChangeStatuses, COMPACTION_SYSTEM_PROMPT,
@@ -3619,7 +3621,9 @@ async function runAgentPass(
       }
       return false;
     },
-  }, emit, abortSignal, handle.stream);
+    // A provider 429 is retried with backoff before it becomes the turn's failure; the specialist
+    // spawner path hit OpenAI's wholesale limit and Anthropic's on the first live proposal run.
+  }, emit, abortSignal, withRateLimitRetry(handle, {chatId}));
 
   // (No end-of-turn flush: every completed step's effects were barrier-committed with its
   // message, and an abort simply drops the in-flight step's buffer -- nothing durable exists
