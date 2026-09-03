@@ -2229,6 +2229,7 @@ export default function GadgetEditor() {
                   pendingGadgetIds={pendingGadgetIds}
                   streamingActiveFile={streamingActiveFileForSelected}
                   isAgentActive={isAgentActive}
+                  operateOnly={selectedGadgetSummary?.operateOnly}
                   isVisible={activeTab === 'code'}
                   onHasCodeChange={setHasCode}
                   onChatContentChange={setChatContent}
