@@ -3632,6 +3632,13 @@ export type WorkpieceSummary = {
    * reverted (or the chat is deleted).
    */
   chatId?: number;
+
+  /**
+   * If true, this gadget is operated rather than edited here (inherited from its blueprint; see
+   * BlueprintMetadata.operateOnly). Chat agents cannot propose code changes to it, so the code
+   * view is read-only.
+   */
+  operateOnly?: true;
 };
 
 /** Callback interface used to receive workpiece-list updates. See Overseer.subscribeToWorkpieces(). */
@@ -3865,6 +3872,18 @@ export type BlueprintMetadata = {
    * created from this blueprint, and preserved when such a gadget is republished as a blueprint.
    */
   output?: BlueprintOutput;
+
+  /**
+   * If true, gadgets instantiated from this blueprint are *operated*, not edited here: a chat
+   * agent drives them through their RPC methods but may not propose code changes to them, and the
+   * host always runs their committed (main) code. Declared by the blueprint's author and opt-in --
+   * absent means an ordinary gadget, so existing blueprints and ordinary "build me a gadget" chats
+   * are unaffected.
+   *
+   * Like `output`, this arrives from an uploaded archive, so it must confer nothing: it only ever
+   * *restricts* what may be done to the gadget it creates.
+   */
+  operateOnly?: true;
 
   /** Key = binding name. */
   bindings: Record<string, BlueprintBinding>;
