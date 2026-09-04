@@ -1344,6 +1344,19 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
+   * Account ids this user holds for `vendorId`, in creation order. Used to auto-fill the owner's
+   * actor choices when they have exactly one account for a vendor.
+   */
+  async listAccountIdsForVendor(vendorId: string): Promise<number[]> {
+    await this.#ensureAutoProvisionedAccounts();
+    let ids: number[] = [];
+    for (let rec of this.#connectedAccountRecords()) {
+      if (rec.vendorId === vendorId) ids.push(rec.id);
+    }
+    return ids;
+  }
+
+  /**
    * Get the gatekeeper class implementing a singleton account's agent session. The overseer installs
    * this gatekeeper into the owner's gadgets (as a Facet) like any other gatekeeper, so the session
    * and catalog run gadget-side in the gatekeeper's own worker — no further round-trips through this

@@ -24,8 +24,8 @@ import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudf
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import type {
   AccountDescription, ActionKind, ApprovalQueue, Gatekeeper, GatekeeperConnectCallback,
-  GatekeeperUser, GatekeeperUserVerifier, ResourceDescription, ResourceConfiguratorFrame,
-  SupportedResource, VendorDescription,
+  GatekeeperSessionActor, GatekeeperUser, GatekeeperUserVerifier, ResourceDescription,
+  ResourceConfiguratorFrame, SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 
 // Nothing but classes and the default handler may be exported from a Worker entry module: workerd
@@ -43,6 +43,8 @@ const TYPES_CODE = `
 interface TestThing {
   readValue(): Promise<number>;
   writeValue(value: number): Promise<number>;
+  /** The account label this session is executing as. */
+  whoAmI(): Promise<string>;
 }
 `;
 
@@ -296,6 +298,7 @@ export class TestVerifier
 export interface TestSession {
   readValue(): Promise<number>;
   writeValue(value: number): Promise<number>;
+  whoAmI(): Promise<string>;
 }
 
 @validateRpc()
@@ -335,6 +338,10 @@ class TestSessionTarget extends RpcTarget implements TestSession {
     }
   }
 
+  async whoAmI(): Promise<string> {
+    return this.label;
+  }
+
   [Symbol.dispose](): void {
     this.approvalQueue[Symbol.dispose]();
   }
@@ -372,9 +379,17 @@ export class TestGatekeeper
     return [];
   }
 
-  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
-    return new TestSessionTarget(
-        approvalQueue, control(this.ctx.exports), this.ctx.props.label);
+  async startSession(
+      approvalQueue: RpcStub<ApprovalQueue>,
+      actor?: GatekeeperSessionActor): Promise<TestSession> {
+    let label = this.ctx.props.label;
+    if (actor !== undefined) {
+      if (actor.verifier === undefined) {
+        throw new Error("Please reconnect the account.");
+      }
+      label = await (actor.verifier as Fetcher<TestVerifierApi>).identify();
+    }
+    return new TestSessionTarget(approvalQueue, control(this.ctx.exports), label);
   }
 
   /**
