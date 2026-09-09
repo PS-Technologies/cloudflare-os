@@ -23,7 +23,8 @@ import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudf
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import type {
   AccountDescription, ActionKind, AgentCatalog, ApprovalQueue, Gatekeeper,
-  GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, ResourceDescription,
+  GatekeeperConnectCallback, GatekeeperSessionActor, GatekeeperUser, GatekeeperUserVerifier,
+  ResourceDescription,
   ResourceConfiguratorFrame, SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
@@ -46,6 +47,8 @@ interface TestThing {
   readValue(): Promise<number>;
   writeValue(value: number): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
+  /** The account label this session is executing as. */
+  whoAmI(): Promise<string>;
 }
 `;
 
@@ -314,6 +317,7 @@ export interface TestSession {
   /** `incomplete` omits the `descriptionIsComplete` claim, as a summary-only gatekeeper would. */
   writeValue(value: number, opts?: { autoApprovable?: boolean; incomplete?: boolean }): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
+  whoAmI(): Promise<string>;
 }
 
 @validateRpc()
@@ -363,6 +367,10 @@ class TestSessionTarget extends RpcTarget implements TestSession {
     return Promise.all(values.map(value => this.writeValue(value)));
   }
 
+  async whoAmI(): Promise<string> {
+    return this.label;
+  }
+
   [Symbol.dispose](): void {
     this.approvalQueue[Symbol.dispose]();
   }
@@ -402,9 +410,17 @@ export class TestGatekeeper
     return [SET_VALUE_ACTION_KIND];
   }
 
-  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
-    return new TestSessionTarget(
-        approvalQueue, control(this.ctx.exports), this.ctx.props.label);
+  async startSession(
+      approvalQueue: RpcStub<ApprovalQueue>,
+      actor?: GatekeeperSessionActor): Promise<TestSession> {
+    let label = this.ctx.props.label;
+    if (actor !== undefined) {
+      if (actor.verifier === undefined) {
+        throw new Error("Please reconnect the account.");
+      }
+      label = await (actor.verifier as Fetcher<TestVerifierApi>).identify();
+    }
+    return new TestSessionTarget(approvalQueue, control(this.ctx.exports), label);
   }
 
   /** No discovery index: the ambient fixture is reached through its session alone. */
