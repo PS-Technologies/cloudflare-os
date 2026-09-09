@@ -88,6 +88,7 @@ export async function openFakeOverseer(
       joinPresence: () => () => {},
       joinOutputsFanout: () => () => {},
       ensureObserver: async () => {},
+      ensureOwnerActorAccounts: async () => {},
       syncOutputsTo: async () => {},
       recordGadgetAnalytics: () => {},
       wrapUserDo: (stub: unknown) => stub,

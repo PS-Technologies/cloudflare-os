@@ -94,6 +94,38 @@ const CONNECTION_SPEC = {
 };
 
 describe("restarting sessions when verification scope widens", () => {
+  it("refuses a session if its connection is quarantined while its actor verifier is resolving",
+      () => withImpl(async (impl, restarts) => {
+    seedGatekeeper(impl, 1);
+    seedGadget(impl, 100);
+    joinSession(impl, "use");
+    impl.storage.actorAccounts.put({profileId: OWNER, accountChoices: {1: 7}});
+    let resumeVerifier!: (value: object) => void;
+    let startedVerifier!: () => void;
+    const started = new Promise<void>(resolve => { startedVerifier = resolve; });
+    impl.users = {
+      idFromName: (id: string) => id,
+      get: () => ({
+        listAccountIdsForVendor: async () => [7],
+        getVerifier: () => {
+          startedVerifier();
+          return new Promise(resolve => { resumeVerifier = resolve; });
+        },
+      }),
+    };
+    let minted = 0;
+    const opening = impl.openGatekeeperSession(1, {
+      startSession: async () => { minted++; return {}; },
+    }, {from: "user", profileId: OWNER});
+    await started;
+    // This live use collaborator was admitted before the newly bound connection entered its scope.
+    impl.bindWorkpiece(100, "RESOURCE", 1);
+    expect(restarts).toHaveLength(1);
+    resumeVerifier({});
+    await expect(opening).rejects.toThrow(/restarting/);
+    expect(minted).toBe(0);
+  }));
+
   it("adding a connection restarts a connected build collaborator",
       () => withImpl(async (impl, restarts) => {
     joinSession(impl);
