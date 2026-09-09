@@ -122,7 +122,9 @@ async function reset(stub: DurableObjectStub<OverseerDurableObject>) {
 // A gatekeeper class cannot be minted in a test: record connection 31 with one the workspace
 // never instantiates, and answer what a decision asks of its facet.
 function fakeGatekeeper(impl: Impl, applyAction: () => Promise<void> = async () => {}) {
-  impl.storage.gatekeepers.put({id: 31, class: {} as any});
+  impl.storage.gatekeepers.put({id: 31, class: {} as any,
+    creationSpec: {type: "gatekeeper", vendorId: "test",
+      resourceUrl: "https://decision-resume.test", typeUrlPattern: "https://*"}});
   vi.spyOn(impl, "getGatekeeperFacet").mockResolvedValue({applyAction, rejectAction: async () => {}} as
       unknown as Awaited<ReturnType<Impl["getGatekeeperFacet"]>>);
 }
@@ -993,6 +995,8 @@ describe("decisions on a turn's staged writes, for generated sessions", () => {
   ];
 
   it("resumes a suspended turn once, when the last write it waits on is approved", async () => {
+    // The fake provider has no connected account or provisioning policy to consult.
+    vi.spyOn(UserDurableObject.prototype, "listAccountIdsForVendor").mockResolvedValue([]);
     // Every generated turn logs a screenful, failures of the faked services and of the applies
     // generated to fail included, which would bury a failure's report.
     for (const level of ["debug", "info", "warn", "error"] as const) {

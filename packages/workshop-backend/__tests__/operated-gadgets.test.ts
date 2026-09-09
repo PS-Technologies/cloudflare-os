@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
+import { GADGET_ACTOR_SHIM, GADGET_ACTOR_SHIM_MODULE } from "../src/gadget-actor-shim.js";
 import { runInDurableObject } from "cloudflare:test";
 import * as Y from "yjs";
 import type { OverseerDurableObject } from "../src/overseer.js";
@@ -392,7 +393,10 @@ describe("loadGadgetWorker", () => {
 
       // What the facet would load for the specialist (and the app view): the creating chat's
       // version, with the files in it.
-      expect(await loadModules(impl, created.id, 3)).toEqual({ "server.js": "export default {}" });
+      // The session-actor shim (patch 0007) rides along as the main module whenever server.js exists.
+      expect(await loadModules(impl, created.id, 3)).toEqual({
+        "server.js": "export default {}", [GADGET_ACTOR_SHIM_MODULE]: GADGET_ACTOR_SHIM,
+      });
       // What it loaded before this rule: main, which a pending gadget does not have.
       await expect(loadModules(impl, created.id, undefined)).rejects.toThrow(
           `Gadget ${created.id} has no server.js to load (files: 0)`);
@@ -406,6 +410,9 @@ describe("loadGadgetWorker", () => {
 
   it("loads the .js modules when server.js is present", async () => {
     expect(await loadWith({ "server.js": "export default {}", "client.js": "", "README.md": "#" }))
-        .toEqual({ "server.js": "export default {}", "client.js": "" });
+        .toEqual({
+          "server.js": "export default {}", "client.js": "",
+          [GADGET_ACTOR_SHIM_MODULE]: GADGET_ACTOR_SHIM,
+        });
   });
 });

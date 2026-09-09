@@ -27,7 +27,7 @@ import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/co
 import { HookRegistry, type HookCapabilities, type HookDelivery } from "@gadgets/gatekeeper-kit/hook-registry";
 import type {
   AccountDescription, ActionDescription, ActionKind, AgentCatalog, ApprovalQueue, ConnectHandoff,
-  Gatekeeper, GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, HookController,
+  Gatekeeper, GatekeeperSessionActor, GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, HookController,
   HookInitiator, HookTargetMetadata, ResourceDescription, ResourceConfiguratorFrame,
   SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
@@ -52,6 +52,8 @@ interface TestThing {
   readValue(): Promise<number>;
   writeValue(value: number): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
+  /** The account label this session is executing as. */
+  whoAmI(): Promise<string>;
   /** Binds a hook the integration test fires through \`/control/fire-hook\`. */
   watch(key: string, callback: ValueHook): Promise<void>;
   /** Binds a hook the integration test delivers through \`/control/queue-hook\`. */
@@ -684,6 +686,7 @@ export interface TestSession {
   /** `incomplete` omits the `descriptionIsComplete` claim, as a summary-only gatekeeper would. */
   writeValue(value: number, opts?: { autoApprovable?: boolean; incomplete?: boolean }): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
+  whoAmI(): Promise<string>;
   watch(key: string, callback: RpcStub<ValueHook>): Promise<void>;
   /** Binds a hook kept in a `HookRegistry`, which `/control/queue-hook` delivers to by `name`. */
   subscribe(name: string, callback: RpcStub<ValueHook>): Promise<void>;
@@ -755,6 +758,10 @@ class TestSessionTarget extends RpcTarget implements TestSession {
 
   async writeValues(values: number[]): Promise<number[]> {
     return Promise.all(values.map(value => this.writeValue(value)));
+  }
+
+  async whoAmI(): Promise<string> {
+    return this.label;
   }
 
   async watch(key: string, callback: RpcStub<ValueHook>): Promise<void> {
@@ -869,8 +876,17 @@ export class TestGatekeeper
     return [SET_VALUE_ACTION_KIND];
   }
 
-  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
-    return new TestSessionTarget(approvalQueue, control(this.ctx.exports), this.ctx.props.label,
+  async startSession(
+      approvalQueue: RpcStub<ApprovalQueue>,
+      actor?: GatekeeperSessionActor): Promise<TestSession> {
+    let label = this.ctx.props.label;
+    if (actor !== undefined) {
+      if (actor.verifier === undefined) {
+        throw new Error("Please reconnect the account.");
+      }
+      label = await (actor.verifier as Fetcher<TestVerifierApi>).identify();
+    }
+    return new TestSessionTarget(approvalQueue, control(this.ctx.exports), label,
         this.ctx.props.resourceUrl, this.ctx);
   }
 
