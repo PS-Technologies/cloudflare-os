@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
+import type { RpcStub } from "capnweb";
+import type { TestSession } from "../fixtures/gatekeeper-test/src/test-gatekeeper.js";
 import { openAgentSession, type WorkshopAgentSession } from "../src/agent-session.js";
 import {
   startTestGatekeeperHarness, TEST_VENDOR_ID, testActionState, type Harness,
@@ -8,7 +10,8 @@ import {
 } from "../src/mock-model.js";
 import { NetworkInterceptor } from "../src/network-interceptor.js";
 import {
-  accountLabel, connect, listConnectedAccounts, nextUsernames, signUp, waitFor, withOwnerWorkspace,
+  accountLabel, connect, listConnectedAccounts, logIn, nextUsernames, signUp, waitFor,
+  withOwnerWorkspace,
 } from "../src/rpc-client.js";
 
 let harness: Harness;
@@ -72,7 +75,7 @@ it.concurrent("a created resource is made in the approver's account, and edits a
   const model = models.script([
     CREATE_NOTES,
     runCode("use-notes", "await env.NOTES.readValue(), await env.NOTES.writeValue(9)"),
-    // The resumed turn replays the creation to re-bind NOTES, now to the created thing.
+    // The resumed turn re-binds the real resource; its accountless initiator must now be refused.
     runCode("read-created", "await env.NOTES.readValue()"),
     { text: "The notes are set." },
   ]);
@@ -118,9 +121,27 @@ it.concurrent("a created resource is made in the approver's account, and edits a
   ]);
   expect(model.requests.at(-1)).toMatchObject({ messages: expect.arrayContaining([
     expect.objectContaining(
-        { role: "tool", tool_call_id: "read-created", content: expect.stringContaining("42") }),
+        { role: "tool", tool_call_id: "read-created",
+          content: expect.stringContaining("Please reconnect the account.") }),
   ]) });
   expect(model.remainingSteps()).toBe(0);
+
+  // Approval grants creation and the queued edit, not the approver's identity to later readers.
+  using ownerPublicApi = connect(harness.url);
+  using ownerApi = await logIn(ownerPublicApi, session.username);
+  using ownerWorkspace = await ownerApi.openGadget(workspaceId);
+  using connection = await ownerWorkspace.getGatekeeperById(creation.gatekeeperId!);
+  await expect(connection.openSession()).rejects.toThrow("Please reconnect the account.");
+
+  // Connecting the initiator's own account authorizes a fresh session without borrowing the
+  // account used to create the resource, including when the account appears after workspace open.
+  await ownerApi.provisionAmbientAccount(TEST_VENDOR_ID);
+  const ownerAccount = (await listConnectedAccounts(ownerApi))
+      .find(a => a.vendorId === TEST_VENDOR_ID)!;
+  expect(accountLabel(ownerAccount)).not.toBe(accountLabel(account));
+  using ownSession = await connection.openSession() as RpcStub<TestSession>;
+  expect(await ownSession.whoAmI()).toBe(accountLabel(ownerAccount));
+  expect(await ownSession.readValue()).toBe(42);
 });
 
 it.concurrent("rejecting a creation rejects the edits queued on it and removes the connection",

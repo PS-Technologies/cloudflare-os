@@ -32,6 +32,7 @@ import type {
   ActionDescription, ActionKind, Gatekeeper, GitObjectType, GitOid, HookController,
   HookDescription, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import type { ActorAccountRecord } from "../actor";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
 
 // =======================================================================================
@@ -380,9 +381,11 @@ export interface GitObjectMetadataRecord {
 export type GatekeeperCaller = {
   from: "agent";
   chatId: number;
+  profileId?: string;
 } | {
   from: "gadget";
   chatId?: number;
+  profileId?: string;
 
   /**
    * Which gadget made the call. Optional for backward compatibility: callers embedded in
@@ -393,6 +396,7 @@ export type GatekeeperCaller = {
 } | {
   from: "user";
   chatId?: number;
+  profileId?: string;
 } | {
   from: "hook";
 };
@@ -1467,6 +1471,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // Non-owner collaborators who have configured their gatekeeper accounts and passed all
       // `addObserver` checks. See `ObserverRecord`. The secondary index lets the forward-exclusion
       // path (`authorizeObservation`) map an opaque observerId back to a profileId.
+      // Owner account choices are never used as a fallback for another person.
+      actorAccounts: collection<ActorAccountRecord>()({primaryKey: "profileId"}),
+
       observers: collection<ObserverRecord>()({
         primaryKey: "profileId",
         uniqueIndexes: {
