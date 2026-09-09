@@ -4,7 +4,7 @@ import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, Work
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
-import { type AgentCatalog, Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
+import { type AgentCatalog, Gatekeeper, type GatekeeperSessionActor, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
@@ -70,6 +70,8 @@ import {
   type GadgetExportEntrypoint,
   readCustomExportFormats,
 } from "./gadget-export";
+import { GADGET_ACTOR_SHIM, GADGET_ACTOR_SHIM_MODULE } from "./gadget-actor-shim";
+import { resolveSessionActor, type ActorAccountRecord } from "./actor";
 
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
@@ -1485,6 +1487,13 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
             return observer.observerId;
           }
         }
+      }),
+
+      // The owner's chosen account per in-scope gatekeeper, so a query can run as them. Distinct
+      // from `observers` (collaborators only). Filled on owner open; never used as a fallback for
+      // anyone else.
+      actorAccounts: collection<ActorAccountRecord>()({
+        primaryKey: "profileId",
       }),
     }
   });
@@ -3543,13 +3552,30 @@ class OverseerImpl implements AgentHooks {
         .map(pin => ({gadgetId: pin.gadgetId, baseCommit: pin.baseCommit}));
   }
 
-  makeBindingLoopback(target: BindingLoopbackTarget, caller: GatekeeperCaller) {
+  makeBindingLoopback(
+      target: BindingLoopbackTarget, caller: GatekeeperCaller, actorCall?: string) {
     let props: GatekeeperLoopbackProps = {
       overseerId: this.ctx.id.toString(),
       target,
       caller,
+      actorCall,
     };
     return this.ctx.exports.GatekeeperLoopback({props});
+  }
+
+  // Per-call bag a gadget facet invocation carries: one viewer-scoped loopback per visible binding,
+  // plus a live `actorCall` id so a stashed stub cannot be replayed after the call settles.
+  actorBagFor(
+      gadgetId: WorkpieceId, chatId: number | undefined,
+      actorProfileId: string | undefined, actorCall: string): Record<string, unknown> {
+    let gadget = this.getGadgetRecord(gadgetId);
+    let caller: GatekeeperCaller = {from: "gadget", chatId, gadgetId, profileId: actorProfileId};
+    let bag: Record<string, unknown> = {};
+    for (let [name, edge] of this.visibleBindings(gadget, chatId)) {
+      bag[name] = this.makeBindingLoopback(
+          {type: "gatekeeper", id: edge.target}, caller, actorCall);
+    }
+    return bag;
   }
 
   // Build the flat `env` handed to a gadget's dynamically-loaded worker: the gadget's named
@@ -3572,10 +3598,12 @@ class OverseerImpl implements AgentHooks {
   // gadget's RPC stub, a gatekeeper session stub, or an agent callback's stored arguments.
   // Entries whose targets no longer exist are silently skipped, mirroring the deleted-gadget
   // behavior elsewhere. `executionId` is the calling executeCodeMode run, minted into worktree
-  // loopbacks so they are usable only from within that execution.
+  // loopbacks so they are usable only from within that execution. `initiator` is the person whose
+  // message started the turn; a callback-initiated turn has none, so its sessions get no actor.
   getEnvForAgent(chatId: number, bindings: Record<string, ChatBindingEntry>,
-                 executionId: string): object {
-    let caller: GatekeeperCaller = {from: "agent", chatId};
+                 executionId: string, initiator?: AiChatAuthorInfo): object {
+    let profileId = initiator?.type === "user" ? initiator.id : undefined;
+    let caller: GatekeeperCaller = {from: "agent", chatId, profileId};
     // This must be a *plain* object: it becomes the loaded worker's `env`, and the loader's
     // serializer rejects anything else (including a null-prototype object) with DataCloneError.
     // So prototype-pollution safety comes from validation instead: names from before name
@@ -3631,6 +3659,10 @@ class OverseerImpl implements AgentHooks {
   // Which chat ID is each gadget's facet currently running from? Keyed by gadget ID; a gadget
   // with no entry has never had its facet loaded this session.
   #runningChatIds = new Map<WorkpieceId, number | null>();
+
+  // Per-call ids currently inside a gadget facet `__invoke`. A loopback whose `actorCall` is set
+  // but missing here is a stashed capability being replayed after the call settled — refuse it.
+  #liveActorCalls = new Set<string>();
 
   proposedChangesChanged(chatId: number) {
     for (let [gadgetId, runningChatId] of this.#runningChatIds) {
@@ -5087,9 +5119,12 @@ class OverseerImpl implements AgentHooks {
         compatibilityFlags: [
           // Make ctx.restore() available.
           "allow_irrevocable_stub_storage",
+          // AsyncLocalStorage for the per-call viewer-scoped binding bag (gadget-actor-shim.ts).
+          "nodejs_als",
         ],
-        mainModule: "server.js",
-        modules,
+        mainModule: "server.js" in modules ? GADGET_ACTOR_SHIM_MODULE : "server.js",
+        modules: "server.js" in modules
+            ? {...modules, [GADGET_ACTOR_SHIM_MODULE]: GADGET_ACTOR_SHIM} : modules,
         env: this.getEnvForLoader(gadgetId, {from: "gadget", chatId, gadgetId}, chatId),
         globalOutbound: null,
 
@@ -5201,7 +5236,8 @@ class OverseerImpl implements AgentHooks {
   //
   // Since facet stubs currently can't be sent over RPC, the stub is wrapped in a Proxy to make it
   // look like an RpcTarget instead.
-  async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number, joinAs?: SessionKind)
+  async getGadgetFacet(
+      gadgetId: WorkpieceId, chatId?: number, joinAs?: SessionKind, actorProfileId?: string)
       : Promise<RpcStub<any>> {
     let facet = await this.getGadgetFacetFetcher(gadgetId, chatId);
     let leaveSession = joinAs ? this.joinSession(joinAs) : undefined;
@@ -5239,7 +5275,11 @@ class OverseerImpl implements AgentHooks {
         //   possibly a runtime bug which needs investigation.
         // TODO: Fix exception reporting it tail workers so we can remove this hack.
         return (...args: any[]) => {
-          let result: Promise<any> = Reflect.apply(method, target, args);
+          let callId = crypto.randomUUID();
+          let bag = self.actorBagFor(gadgetId, chatId, actorProfileId, callId);
+          self.#liveActorCalls.add(callId);
+          let result: Promise<any> = (target as any).__invoke(bag, prop, args)
+              .finally(() => { self.#liveActorCalls.delete(callId); });
           return result.catch((err: any) => {
             let msg = err;
             if (err instanceof Error) {
@@ -5499,9 +5539,10 @@ class OverseerImpl implements AgentHooks {
 
   // `joinAs` counts the returned client toward #hasCollaboratorSession for its lifetime; passed by
   // the collaborator-facing mints, omitted for the owner's and for internal callers (see
-  // GadgetClientImpl).
+  // GadgetClientImpl). `caller` names the person the client acts for (session actor, patch 0007).
   async addGatekeeper(
-      cls: GatekeeperClass, creationSpec?: GatekeeperCreationSpec, joinAs?: SessionKind)
+      cls: GatekeeperClass, creationSpec?: GatekeeperCreationSpec, joinAs?: SessionKind,
+      caller: GatekeeperCaller = {from: "user"})
       : Promise<GatekeeperClient<any>> {
     let id = this.allocateWorkpieceId();
     let gatekeeperRecord: GatekeeperRecord = {
@@ -5552,7 +5593,7 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
-    return new GatekeeperClientImpl<any>(this, id, facet, undefined, joinAs);
+    return new GatekeeperClientImpl<any>(this, id, facet, caller, joinAs);
   }
 
   // Destroy a gatekeeper (connection) workpiece. Any binding edges pointing at it are severed so
@@ -5608,14 +5649,20 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Open the session behind a binding loopback.
-  startGatekeeperSession(target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
+  startGatekeeperSession(
+      target: BindingLoopbackTarget, caller: GatekeeperCaller, actorCall?: string): Promise<any> {
+    if (actorCall !== undefined && !this.#liveActorCalls.has(actorCall)) {
+      throw new Error(
+          "This binding capability was only valid for the gadget call that created it.");
+    }
     switch (target.type) {
       case "gadget": {
         if (caller.from === "agent") {
           this.#getOrCreateCapturedActions(caller.chatId).accessedGadget = true;
         }
         let chatId = "chatId" in caller ? caller.chatId : undefined;
-        return this.getGadgetFacet(target.id, chatId);
+        let profileId = "profileId" in caller ? caller.profileId : undefined;
+        return this.getGadgetFacet(target.id, chatId, undefined, profileId);
       }
 
       case "gatekeeper": {
@@ -8687,7 +8734,7 @@ class OverseerImpl implements AgentHooks {
           "agent.js": code,
         },
         // The agent's env holds the chat's named bindings (see getEnvForAgent).
-        env: this.getEnvForAgent(chatId, bindings, executionId),
+        env: this.getEnvForAgent(chatId, bindings, executionId, initiator),
         tails: [this.ctx.exports.CodeModeTailLoopback({props: tailProps})],
         globalOutbound: null,
       };
@@ -9731,6 +9778,74 @@ class OverseerImpl implements AgentHooks {
     this.storage.observers.put({profileId, observerId, accountChoices});
   }
 
+  // Fill the owner's per-binding account choices so a later query can run as them. Unlike
+  // ensureObserver this does not refuse the open: a missing choice means that binding's session
+  // will have no verifier, and the gatekeeper answers with its own reconnect text.
+  async ensureOwnerActorAccounts(
+      profileId: string,
+      owner: DurableObjectStub<UserDurableObject>,
+      configureCb?: RpcStub<ObserverConfigCallback>): Promise<void> {
+    let inScope = this.#inScopeGatekeepers("build");
+    if (inScope.length === 0) return;
+
+    let record = this.storage.actorAccounts.get(profileId);
+    let accountChoices: {[gatekeeperId: number]: number} = {...record?.accountChoices};
+
+    let idsByVendor = new Map<string, number[]>();
+    for (let gk of inScope) {
+      let vendorId = observerVendorId(gk);
+      if (!vendorId) continue;
+      let ids = idsByVendor.get(vendorId);
+      if (!ids) {
+        ids = await owner.listAccountIdsForVendor(vendorId);
+        idsByVendor.set(vendorId, ids);
+      }
+      let chosen = accountChoices[gk.id];
+      if (chosen !== undefined && ids.includes(chosen)) continue;
+      // A stale choice names an account the owner has since disconnected. Left in place it resolves
+      // to no verifier on every session, and the gatekeeper keeps telling them to reconnect -- which
+      // mints a new account id and never repairs the choice. Drop it and choose again the way a
+      // first open does.
+      delete accountChoices[gk.id];
+      if (ids.length === 1) accountChoices[gk.id] = ids[0]!;
+    }
+
+    let uncovered = inScope.filter(gk => !(gk.id in accountChoices));
+    if (uncovered.length > 0 && configureCb) {
+      let choices = await configureCb.configure(uncovered.map(observerBindingNeed));
+      let uncoveredIds = new Set(uncovered.map(gk => gk.id));
+      for (let choice of choices) {
+        if (!uncoveredIds.has(choice.gatekeeperId) || !Number.isSafeInteger(choice.accountId)) {
+          continue;
+        }
+        accountChoices[choice.gatekeeperId] = choice.accountId;
+      }
+    }
+
+    this.storage.actorAccounts.put({profileId, accountChoices});
+  }
+
+  async resolveActorForSession(
+      gatekeeperId: number, caller: GatekeeperCaller): Promise<GatekeeperSessionActor | undefined> {
+    let record = this.storage.gatekeepers.get(gatekeeperId);
+    if (!record) return undefined;
+    let vendorId: string | null;
+    try {
+      vendorId = observerVendorId(record);
+    } catch {
+      return undefined;
+    }
+    let profileId = "profileId" in caller ? caller.profileId : undefined;
+    let observer = profileId === undefined ? undefined : this.storage.observers.get(profileId);
+    let ownerChoices = profileId === undefined ? undefined : this.storage.actorAccounts.get(profileId);
+    return resolveSessionActor(
+        profileId, gatekeeperId, vendorId, observer, ownerChoices,
+        (pid, accountId, vendor) => {
+          let user = this.users.get(this.users.idFromName(pid));
+          return user.getVerifier(accountId, vendor);
+        });
+  }
+
   // Render the observer verification failures as one line per binding, naming the connection and the
   // account that was refused: `<resourceTitle> (<account label>) — <reason>`. Cold path only (we're
   // about to deny the open), so the extra User DO round trip per failure is fine. Discloses nothing
@@ -10023,6 +10138,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
     // index have never pushed at all, so re-syncing on open is what corrects both.
     if (isOwner) {
       this.impl.markOutputsDirty();
+      await this.impl.ensureOwnerActorAccounts(profileId, owner, configureObservers);
     }
 
     // The caller's effective role. The owner always has "build".
@@ -10357,8 +10473,8 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async startGatekeeperSession(
-      target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
-    return this.impl.startGatekeeperSession(target, caller);
+      target: BindingLoopbackTarget, caller: GatekeeperCaller, actorCall?: string): Promise<any> {
+    return this.impl.startGatekeeperSession(target, caller, actorCall);
   }
 
   startGatekeeperHook(id: number): NativeRpcStub<RpcTarget> {
@@ -10527,6 +10643,7 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
 type GatekeeperCaller = {
   from: "agent";
   chatId: number;
+  profileId?: string;
 } | {
   from: "gadget";
   chatId?: number;
@@ -10535,9 +10652,11 @@ type GatekeeperCaller = {
   // ActionRecords persisted before multi-gadget support have no gadgetId. `defaultGadgetId`
   // should be assumed when `gadgetId` is absent.
   gadgetId?: WorkpieceId;
+  profileId?: string;
 } | {
   from: "user";
   chatId?: number;
+  profileId?: string;
 } | {
   from: "hook";
 };
@@ -10548,6 +10667,9 @@ type GatekeeperLoopbackProps = {
   target: BindingLoopbackTarget;
 
   caller: GatekeeperCaller;
+
+  // Set on per-call gadget bags. The session opener refuses the stub once the call has settled.
+  actorCall?: string;
 };
 
 type BindingLoopbackTarget = {
@@ -10584,7 +10706,7 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
 
     // @ts-ignore: LSP-only RPC types bug, "type instantiation is excessively deep"
     let session = stub.startGatekeeperSession(
-        this.ctx.props.target, this.ctx.props.caller);
+        this.ctx.props.target, this.ctx.props.caller, this.ctx.props.actorCall);
 
     return new Proxy(session, {
       get(target, prop, receiver) {
@@ -11076,14 +11198,15 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
     return new GadgetClientImpl(this.impl, record.id, this.clientUserId,
-        this.#mintedCapabilityKind());
+        this.#mintedCapabilityKind(), this.clientProfileId);
   }
 
   async getGadget(id: WorkpieceId): Promise<RpcStub<GadgetClient>> {
     this.impl.getGadgetRecord(id);  // validate it exists
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new GadgetClientImpl(this.impl, id, this.clientUserId, this.#mintedCapabilityKind());
+    return new GadgetClientImpl(this.impl, id, this.clientUserId, this.#mintedCapabilityKind(),
+        this.clientProfileId);
   }
 
   async deleteSelf(): Promise<void> {
@@ -11159,7 +11282,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // sessions that restart is about to sever (see #gatekeepersPendingRestart).
     this.impl.assertGatekeeperUsable(id);
     return new GatekeeperClientImpl(this.impl, id, this.impl.getGatekeeperFacet(id),
-        undefined, this.#mintedCapabilityKind());
+        {from: "user", profileId: this.clientProfileId}, this.#mintedCapabilityKind());
   }
 
   private async recordConnectionCreated(
@@ -11185,7 +11308,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
       resourceUrl,
       typeUrlPattern,
     };
-    let result = await this.impl.addGatekeeper(cls, creationSpec, this.#mintedCapabilityKind());
+    let result = await this.impl.addGatekeeper(
+        cls, creationSpec, this.#mintedCapabilityKind(),
+        {from: "user", profileId: this.clientProfileId});
     await this.recordConnectionCreated(result, "gatekeeper", vendorId);
     return result;
   }
@@ -12488,7 +12613,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
     }
     // @ts-expect-error An RpcTarget implementing the interface works in place of a stub, but the
     //     type system doesn't know this.
-    return new UseGadgetClientInterface(this.impl, id, this.clientUserId);
+    return new UseGadgetClientInterface(this.impl, id, this.clientUserId, this.clientProfileId);
   }
 
   // --- Denied methods (build-only) ---
@@ -12642,7 +12767,8 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   #leaveSession?: () => void;
 
   constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string, private joinedAs?: SessionKind) {
+      private clientUserId: string, private joinedAs?: SessionKind,
+      private clientProfileId?: string) {
     super();
     if (joinedAs) this.#leaveSession = impl.joinSession(joinedAs);
   }
@@ -12689,7 +12815,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     });
     // The facet stub counts exactly as this capability does (joinedAs): it can outlive this
     // object, and it is the very stub a hook-enable widening's data flows through.
-    return this.impl.getGadgetFacet(this.id, chatId, this.joinedAs);
+    return this.impl.getGadgetFacet(this.id, chatId, this.joinedAs, this.clientProfileId);
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
@@ -12724,7 +12850,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     // The child capability counts exactly as this one does: it can outlive this object.
     return new GatekeeperClientImpl(
         this.impl, edge.target, this.impl.getGatekeeperFacet(edge.target),
-        undefined, this.joinedAs);
+        {from: "user", profileId: this.clientProfileId}, this.joinedAs);
   }
 
   async bind(name: string, target: WorkpieceId, chatId?: number): Promise<void> {
@@ -12915,7 +13041,7 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
   #leaveSession: () => void;
 
   constructor(private impl: OverseerImpl, private id: WorkpieceId,
-      private clientUserId: string) {
+      private clientUserId: string, private clientProfileId: string) {
     super();
     this.#leaveSession = impl.joinSession("use");
   }
@@ -12964,7 +13090,7 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
     });
     // The facet stub counts as a "use" session for its own lifetime, like this interface: it can
     // outlive this object, and it is the very stub a hook-enable widening's data flows through.
-    return this.impl.getGadgetFacet(this.id, undefined, "use");
+    return this.impl.getGadgetFacet(this.id, undefined, "use", this.clientProfileId);
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
@@ -13059,8 +13185,9 @@ class GatekeeperClientImpl<Session extends RpcCompatible<Session>>
     // through here, so this is where a connection still blocked pending a scope-widening restart
     // is refused (see #gatekeepersPendingRestart).
     this.impl.assertGatekeeperUsable(this.id);
+    let actor = await this.impl.resolveActorForSession(this.id, this.caller);
     // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
-    return this.facet.startSession(new ApprovalQueueImpl(this.impl, this.id, this.caller));
+    return this.facet.startSession(new ApprovalQueueImpl(this.impl, this.id, this.caller), actor);
   }
 
   async getCreationSpec(): Promise<GatekeeperCreationSpec> {
