@@ -1655,7 +1655,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         });
         return;
       }
-      await account.account.revoke();
+      try {
+        await account.account.revoke();
+      } catch (err) {
+        // A handle to a connector Worker that was since deleted and recreated fails every call,
+        // this one included. The person is removing the account, so a failed revoke must not keep
+        // a dead row on their Connections page. Best-effort, like the ambient branch above.
+        logger.error("revoke() failed during disconnect", {
+          event: "account.revoke.failed",
+          vendorId: account.vendorId, accountId, error: err,
+        });
+      }
       this.storage.connectedAccounts.delete(accountId);
       // Disconnecting the Cloudflare account also clears the AI Gateway billing state (selected
       // account + cached balance), which is meaningless without the underlying grant.
