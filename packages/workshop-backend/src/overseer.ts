@@ -1027,6 +1027,10 @@ const CHAT_CHANGE_MATERIALIZE_THRESHOLD = 1000;
 // (the client discards and rebuilds).
 const CHAT_CHANGE_RETIRED_TTL_MS = 60_000;
 
+// How long a gadget viewer's display name is reused before it is read from their user DO again
+// (see OverseerImpl.viewerFor). Bounds how long a Settings rename takes to reach gadgets.
+const VIEWER_NAME_TTL_MS = 60_000;
+
 // The shape a CodeChangeSubmission.clientId must take. Deliberately strict: the token is
 // client-minted (a UUID satisfies this), becomes part of a storage key, and needs no other
 // structure.
@@ -2711,8 +2715,8 @@ class OverseerImpl implements AgentHooks {
   bindWorkpiece(gadgetId: WorkpieceId, name: string, target: WorkpieceId,
                 chatId?: number): void {
     validateBindingName(name);
-    if (name === "GADGET") {
-      throw new Error("The binding name `GADGET` is reserved.");
+    if (name === "GADGET" || name === "VIEWER") {
+      throw new Error(`The binding name \`${name}\` is reserved.`);
     }
     let gadget = this.getGadgetRecord(gadgetId);
     let existing = gadget.bindings[name];
@@ -2779,8 +2783,8 @@ class OverseerImpl implements AgentHooks {
     }
     if (oldName === newName) return;
     validateBindingName(newName);
-    if (newName === "GADGET") {
-      throw new Error("The binding name `GADGET` is reserved.");
+    if (newName === "GADGET" || newName === "VIEWER") {
+      throw new Error(`The binding name \`${newName}\` is reserved.`);
     }
     if (gadget.bindings[newName]) {
       throw new Error(`There is already a binding named "${newName}".`);
@@ -3597,10 +3601,12 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Per-call bag a gadget facet invocation carries: one viewer-scoped loopback per visible binding,
-  // plus a live `actorCall` id so a stashed stub cannot be replayed after the call settles.
+  // plus a live `actorCall` id so a stashed stub cannot be replayed after the call settles, plus
+  // `VIEWER` (a reserved binding name) when a person is making the call.
   actorBagFor(
       gadgetId: WorkpieceId, chatId: number | undefined,
-      actorProfileId: string | undefined, actorCall: string): Record<string, unknown> {
+      actorProfileId: string | undefined, actorCall: string,
+      viewer?: {id: string, name: string}): Record<string, unknown> {
     let gadget = this.getGadgetRecord(gadgetId);
     let caller: GatekeeperCaller = {from: "gadget", chatId, gadgetId, profileId: actorProfileId};
     let bag: Record<string, unknown> = {};
@@ -3608,6 +3614,7 @@ class OverseerImpl implements AgentHooks {
       bag[name] = this.makeBindingLoopback(
           {type: "gatekeeper", id: edge.target}, caller, actorCall);
     }
+    if (viewer) bag.VIEWER = viewer;
     return bag;
   }
 
@@ -3696,6 +3703,29 @@ class OverseerImpl implements AgentHooks {
   // Per-call ids currently inside a gadget facet `__invoke`. A loopback whose `actorCall` is set
   // but missing here is a stashed capability being replayed after the call settled — refuse it.
   #liveActorCalls = new Set<string>();
+
+  // Display names of people who have called a gadget facet, read from their user DO and re-read
+  // once older than VIEWER_NAME_TTL_MS, so a rename in Settings reaches gadgets within that time.
+  #viewerNames = new Map<string, {name: Promise<string>, readAt: number}>();
+
+  // The person making a gadget facet call, as `{id, name}`: what `env.VIEWER` reads for the call's
+  // duration. `id` is the user DO name (the email under Access, the username for a password
+  // account). Every call from one person chains on the same promise, so facet calls still reach
+  // the gadget in the order that person made them.
+  viewerFor(profileId: string | undefined): Promise<{id: string, name: string} | undefined> {
+    if (profileId === undefined) return Promise.resolve(undefined);
+    let entry = this.#viewerNames.get(profileId);
+    if (!entry || Date.now() - entry.readAt > VIEWER_NAME_TTL_MS) {
+      entry = {
+        readAt: Date.now(),
+        name: this.users.get(this.users.idFromName(profileId)).whoamiIfExists().then(
+            profile => profile?.name ?? profileId,
+            () => { this.#viewerNames.delete(profileId); return profileId; }),
+      };
+      this.#viewerNames.set(profileId, entry);
+    }
+    return entry.name.then(name => ({id: profileId, name}));
+  }
 
   proposedChangesChanged(chatId: number) {
     for (let [gadgetId, runningChatId] of this.#runningChatIds) {
@@ -5301,6 +5331,12 @@ class OverseerImpl implements AgentHooks {
         // that here.
         if (typeof method !== "function" || typeof prop === "symbol") return method;
 
+        // `__invoke` is the shim's entry point for the bag this proxy builds. Forwarded, it would
+        // let a caller install a bag of its own: a forged VIEWER, or no bindings at all.
+        if (prop === "__invoke") {
+          throw new TypeError("`__invoke` cannot be called on a gadget.");
+        }
+
         // HACK: We're going to assume all top-level properties are methods, and we are going to
         //   intercept exceptions thrown by these methods and deliver them to the console log
         //   subscriber. In theory we shouldn't have to do this, because these exceptions should
@@ -5309,10 +5345,11 @@ class OverseerImpl implements AgentHooks {
         // TODO: Fix exception reporting it tail workers so we can remove this hack.
         return (...args: any[]) => {
           let callId = crypto.randomUUID();
-          let bag = self.actorBagFor(gadgetId, chatId, actorProfileId, callId);
           self.#liveActorCalls.add(callId);
-          let result: Promise<any> = (target as any).__invoke(bag, prop, args)
-              .finally(() => { self.#liveActorCalls.delete(callId); });
+          let result: Promise<any> = self.viewerFor(actorProfileId).then(viewer => {
+            let bag = self.actorBagFor(gadgetId, chatId, actorProfileId, callId, viewer);
+            return (target as any).__invoke(bag, prop, args);
+          }).finally(() => { self.#liveActorCalls.delete(callId); });
           return result.catch((err: any) => {
             let msg = err;
             if (err instanceof Error) {
