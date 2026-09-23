@@ -585,13 +585,16 @@ export interface AgentHooks {
   /**
    * Run one executeCode tool call. `worktreeTurn` is the turn's worktree state (see
    * WorktreeTurnAccess): the overseer registers it for the duration of the execution so the
-   * chat's worktree env bindings can resolve against the running turn.
+   * chat's worktree env bindings can resolve against the running turn. `abortSignal` is the
+   * turn's stop signal: an execution parked inside a long binding call must end when the person
+   * clicks Stop, not when that call happens to return.
    */
   executeCodeMode(chatId: number, code: string,
                    initiator: AiChatAuthorInfo, initiatorModelId: string,
                    bindings: Record<string, ChatBindingEntry>,
                    onOutputText?: (delta: string) => void,
-                   worktreeTurn?: WorktreeTurnAccess): Promise<string>;
+                   worktreeTurn?: WorktreeTurnAccess,
+                   abortSignal?: AbortSignal): Promise<string>;
   consumeCapturedActions(chatId: number)
       : {actions: number[], accessedGadget: boolean, awaitDecision: boolean} | undefined;
   emitChatStreamEvent(chatId: number, event: AiChatStreamEvent): void;
@@ -3235,7 +3238,7 @@ async function runAgentPass(
               "that points back to this chat thread.",
         }),
       }),
-      execute: async (toolCallId, {code}) => {
+      execute: async (toolCallId, {code}, signal) => {
         try {
           // Step-transactionality guard: buffered edits are durable only at the step's
           // barrier, so code must not run against content the persisted history doesn't yet
@@ -3255,7 +3258,11 @@ async function runAgentPass(
                 toolCallId,
                 delta,
               }),
-              worktreeTurnAccess);
+              worktreeTurnAccess,
+              // pi-agent-core hands every tool the turn's abort signal; without it the loop can
+              // only stop between tool calls, and a code block parked in a binding call holds
+              // the whole chat until it returns.
+              signal);
           return toolResult(`${output}`, {output: `${output}`} as Partial<AiToolCall>);
         } catch (error) {
           toolCallNotes.set(toolCallId, {
