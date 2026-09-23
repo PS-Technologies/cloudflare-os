@@ -27,6 +27,10 @@ type Impl = {
   getEnvForLoader(gadgetId: WorkpieceId, caller: GatekeeperCaller): Record<string, unknown>;
   startGatekeeperSession(target: unknown, caller: GatekeeperCaller): Promise<GadgetExports>;
   describeBinding(envName: string, id: WorkpieceId): Promise<string>;
+  readGadgetFiles(gadgetId: WorkpieceId, chatId?: number): Promise<Map<string, string>>;
+  loadGadgetWorker(gadgetId: WorkpieceId, chatId?: number): unknown;
+  getGadgetFacet(gadgetId: WorkpieceId, chatId?: number, joinAs?: unknown,
+                 actorProfileId?: string): Promise<unknown>;
 };
 
 const CHAT_ID = 1;
@@ -87,6 +91,32 @@ describe("gadget bindings in the agent's env", () => {
     expect(() => impl.startGatekeeperSession(
         { type: "exports", id: 100 }, { from: "gadget", gadgetId: 100 }))
         .toThrow("only available to the agent's executeCode");
+  }));
+
+  it("export as the person whose turn the agent is taking", () => withImpl(async impl => {
+    // The facet an export opens is what gives the gadget's calls that person's binding sessions
+    // and env.VIEWER (session-actor.test.ts proves that half), so watch who it is opened for.
+    let facetActors: (string | undefined)[] = [];
+    impl.readGadgetFiles = async () => new Map([["server.js", ""]]);
+    impl.loadGadgetWorker = () => ({
+      getEntrypoint: () => ({
+        getExportFormats: async () => [{
+          id: "txt", label: "Text", mode: "server", contentType: "text/plain",
+          fileExtension: ".txt",
+        }],
+        export: async () => new Response("exported").body,
+      }),
+    });
+    impl.getGadgetFacet = async (_gadgetId, _chatId, _joinAs, actorProfileId) => {
+      facetActors.push(actorProfileId);
+      return { [Symbol.dispose]() {} };
+    };
+
+    let exports = await impl.startGatekeeperSession(
+        { type: "exports", id: 100 }, { ...AGENT, profileId: "alice@example.com" });
+    expect(await exports.getFormats()).toEqual([expect.objectContaining({ id: "txt" })]);
+    expect(await new Response(await exports.export("txt")).text()).toBe("exported");
+    expect(facetActors).toEqual(["alice@example.com", "alice@example.com"]);
   }));
 
   it("are described with both properties", () => withImpl(async impl => {
