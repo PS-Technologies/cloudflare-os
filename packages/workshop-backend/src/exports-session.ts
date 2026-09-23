@@ -8,8 +8,9 @@ import type { GadgetExports } from "./exports-binding";
 
 /** What the binding needs from the overseer: the export pipeline behind GadgetClient's. */
 export interface ExportsHost {
-  getGadgetExportFormats(gadgetId: WorkpieceId, chatId?: number): Promise<GadgetExportFormat[]>;
-  exportGadget(gadgetId: WorkpieceId, formatId: string, chatId?: number)
+  getGadgetExportFormats(gadgetId: WorkpieceId, chatId?: number, actorProfileId?: string)
+      : Promise<GadgetExportFormat[]>;
+  exportGadget(gadgetId: WorkpieceId, formatId: string, chatId?: number, actorProfileId?: string)
       : Promise<ReadableStream<Uint8Array>>;
 }
 
@@ -19,19 +20,23 @@ export class GadgetExportsImpl extends RpcTarget implements GadgetExports {
   #host: ExportsHost;
   #gadgetId: WorkpieceId;
   #chatId: number;
+  #actorProfileId: string | undefined;
 
-  constructor(host: ExportsHost, gadgetId: WorkpieceId, chatId: number) {
+  // `actorProfileId` is the person whose turn the agent is taking, so an export runs as them.
+  constructor(host: ExportsHost, gadgetId: WorkpieceId, chatId: number, actorProfileId?: string) {
     super();
     this.#host = host;
     this.#gadgetId = gadgetId;
     this.#chatId = chatId;
+    this.#actorProfileId = actorProfileId;
   }
 
   async getFormats(): Promise<GadgetExportFormat[]> {
-    return this.#host.getGadgetExportFormats(this.#gadgetId, this.#chatId);
+    return this.#host.getGadgetExportFormats(this.#gadgetId, this.#chatId, this.#actorProfileId);
   }
 
   async export(formatId: string): Promise<ReadableStream<Uint8Array>> {
-    return this.#host.exportGadget(this.#gadgetId, formatId, this.#chatId);
+    return this.#host.exportGadget(
+        this.#gadgetId, formatId, this.#chatId, this.#actorProfileId);
   }
 }
