@@ -262,6 +262,39 @@ type PreparedChatMessage = {
 type CatalogGatekeeperFacet =
     Fetcher<Gatekeeper<any> & Required<Pick<Gatekeeper<any>, "getAgentCatalog">>>;
 
+export const EXECUTION_STOPPED_MESSAGE = "Stopped by the person before the code finished.";
+
+/**
+ * Awaits a code execution, or ends it when the turn's stop signal fires first. Stop means stop:
+ * the person clicked it while the code sat inside a binding call (a browser handoff, a slow
+ * query), and the chat must come back to them now, not when that call happens to return.
+ * `dispose` drops the isolate's capabilities so the orphaned call cannot keep acting for this
+ * chat after the turn has ended. Without a signal this is a plain await.
+ */
+export async function raceRunWithStop<T>(
+    run: Promise<T>, signal: AbortSignal | undefined, dispose: () => void): Promise<T> {
+  if (!signal) return await run;
+  let onAbort!: () => void;
+  let stopped = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error(EXECUTION_STOPPED_MESSAGE));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, {once: true});
+  });
+  // The execution keeps running after Stop wins the race; its eventual failure is nobody's.
+  run.catch(() => {});
+  try {
+    return await Promise.race([run, stopped]);
+  } catch (err) {
+    if (signal.aborted) {
+      dispose();
+      throw new Error(EXECUTION_STOPPED_MESSAGE, {cause: err});
+    }
+    throw err;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 function defaultBlueprintBindingTitle(record: GatekeeperRecord, bindingName?: string): string {
   return record.resourceTitle || bindingName || "Connection";
 }
@@ -8337,7 +8370,8 @@ class OverseerImpl implements AgentHooks {
                         initiator: AiChatAuthorInfo, initiatorModelId: string,
                         bindings: Record<string, ChatBindingEntry>,
                         onOutputText?: (delta: string) => void,
-                        worktreeTurn?: WorktreeTurnAccess)
+                        worktreeTurn?: WorktreeTurnAccess,
+                        abortSignal?: AbortSignal)
       : Promise<string> {
     let bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
@@ -8390,6 +8424,8 @@ class OverseerImpl implements AgentHooks {
 
       // First check the code actually starts up. Treat startup errors as total failures.
       await entrypoint.verify();
+      // Stop may arrive while the isolate is starting; do not dispatch its code afterward.
+      abortSignal?.throwIfAborted();
 
       // Create the `self` magic object that allows executed code to call back into this
       // chat thread. Uses the initiator's user ID for model resolution on callbacks.
@@ -8404,8 +8440,12 @@ class OverseerImpl implements AgentHooks {
       try {
         // The forger is a transient stub argument, so the capability to forge persistent
         // gadget-restore stubs lives exactly as long as this run() call.
-        await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings));
+        await raceRunWithStop(
+            entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings)),
+            abortSignal,
+            () => (entrypoint as unknown as {[Symbol.dispose]?(): void})[Symbol.dispose]?.());
       } catch (err) {
+        if (abortSignal?.aborted) throw err;
         if (err instanceof Error && err.stack) {
           error = err.stack;
         } else {
