@@ -1,6 +1,8 @@
 // Shim loaded as the gadget worker's main module so each forwarded facet call can carry a
 // per-call bag of viewer-scoped binding stubs. The author's Gadget class is unchanged: `this.env.X`
-// resolves from the bag while the call runs, and from the load-time env otherwise.
+// resolves from the bag while the call runs, and from the load-time env otherwise. The bag also
+// carries `VIEWER`, `{id, name}` of the person making the call, unless a binding already has that
+// name.
 //
 // `nodejs_als` must be on the worker's compatibilityFlags; without it this module fails to start.
 

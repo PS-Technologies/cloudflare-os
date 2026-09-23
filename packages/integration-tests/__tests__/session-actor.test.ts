@@ -41,6 +41,9 @@ export class Gadget extends DurableObject {
   async replayStashed() {
     return this.stashed.whoAmI();
   }
+  async viewer() {
+    return this.env.VIEWER ?? null;
+  }
 }
 `;
 
@@ -197,6 +200,7 @@ async function connectGadget(
       whoAmI(): Promise<string>;
       stashBinding(): Promise<string>;
       replayStashed(): Promise<string>;
+      viewer(): Promise<{ id: string; name: string } | null>;
     }> {
   const gadget = await overseer.getGadget(gadgetId);
   // The gadget's own methods are not in GadgetClient's type; the fixture server defines them.
@@ -204,6 +208,7 @@ async function connectGadget(
     whoAmI(): Promise<string>;
     stashBinding(): Promise<string>;
     replayStashed(): Promise<string>;
+    viewer(): Promise<{ id: string; name: string } | null>;
   }>;
 }
 
@@ -253,6 +258,25 @@ describe("session actor", () => {
       }
       expect(seen.filter(label => label === shared.aliceLabel)).toHaveLength(20);
       expect(seen.filter(label => label === shared.bobLabel)).toHaveLength(20);
+    });
+  });
+
+  it.concurrent("tells a gadget facet call who the viewer is, with no cross-talk", async () => {
+    await withSession(async publicApi => {
+      const shared = await shareBoundGadget(publicApi, "viewer", "use");
+      await shared.bobApi.setOwnDisplayName("Bob Builder");
+      const aliceId = (await shared.aliceApi.whoami()).id;
+      const bobId = (await shared.bobApi.whoami()).id;
+      using aliceWorkspace = await aliceOpens(shared);
+      using bobWorkspace = await bobOpens(shared);
+      using aliceGadget = await connectGadget(aliceWorkspace, shared.gadgetId);
+      using bobGadget = await connectGadget(bobWorkspace, shared.gadgetId);
+
+      for (let i = 0; i < 10; i++) {
+        const [alice, bob] = await Promise.all([aliceGadget.viewer(), bobGadget.viewer()]);
+        expect(alice).toEqual({ id: aliceId, name: aliceId });
+        expect(bob).toEqual({ id: bobId, name: "Bob Builder" });
+      }
     });
   });
 

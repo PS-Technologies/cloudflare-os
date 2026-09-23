@@ -3697,6 +3697,25 @@ class OverseerImpl implements AgentHooks {
   // but missing here is a stashed capability being replayed after the call settled — refuse it.
   #liveActorCalls = new Set<string>();
 
+  // Display names of people who have called a gadget facet, read once from their user DO.
+  #viewerNames = new Map<string, Promise<string>>();
+
+  // The person making a gadget facet call, as `{id, name}`: what `env.VIEWER` reads for the call's
+  // duration. A present viewer's current name wins over the cached one. Every call from one person
+  // chains on the same promise, so facet calls still reach the gadget in the order they were made.
+  viewerFor(profileId: string | undefined): Promise<{id: string, name: string} | undefined> {
+    if (profileId === undefined) return Promise.resolve(undefined);
+    let name = this.#viewerNames.get(profileId);
+    if (!name) {
+      name = this.users.get(this.users.idFromName(profileId)).whoamiIfExists().then(
+          profile => profile?.name ?? profileId,
+          () => { this.#viewerNames.delete(profileId); return profileId; });
+      this.#viewerNames.set(profileId, name);
+    }
+    return name.then(cached =>
+        ({id: profileId, name: this.#presence.get(profileId)?.user.name ?? cached}));
+  }
+
   proposedChangesChanged(chatId: number) {
     for (let [gadgetId, runningChatId] of this.#runningChatIds) {
       if (runningChatId === chatId) {
@@ -5309,10 +5328,13 @@ class OverseerImpl implements AgentHooks {
         // TODO: Fix exception reporting it tail workers so we can remove this hack.
         return (...args: any[]) => {
           let callId = crypto.randomUUID();
-          let bag = self.actorBagFor(gadgetId, chatId, actorProfileId, callId);
           self.#liveActorCalls.add(callId);
-          let result: Promise<any> = (target as any).__invoke(bag, prop, args)
-              .finally(() => { self.#liveActorCalls.delete(callId); });
+          let result: Promise<any> = self.viewerFor(actorProfileId).then(viewer => {
+            let bag = self.actorBagFor(gadgetId, chatId, actorProfileId, callId);
+            // A binding the gadget named VIEWER keeps its name.
+            if (viewer && !Object.hasOwn(bag, "VIEWER")) bag.VIEWER = viewer;
+            return (target as any).__invoke(bag, prop, args);
+          }).finally(() => { self.#liveActorCalls.delete(callId); });
           return result.catch((err: any) => {
             let msg = err;
             if (err instanceof Error) {

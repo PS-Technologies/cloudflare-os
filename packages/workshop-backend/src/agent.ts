@@ -812,6 +812,8 @@ DO NOT import \`RpcTarget\` in client.js. It is already imported.
 
 If you need \`RpcTarget\` in server.js, you can import it from "cloudflare:workers".
 
+To know who is using the Gadget, read \`this.env.VIEWER\` inside a server method: it is \`{id, name}\` for the signed-in person making that call, where \`id\` is their sign-in email. It is set only while a call made on a person's behalf runs; it is undefined in the constructor, in alarms, and in calls with no person behind them. Take names and authorship from it rather than from arguments the client sends, which anyone can fake.
+
 ## Design Tips
 
 * ALWAYS store server state in Durable Object storage, not just in memory. Memory is OK to use for caching but users expect not to have their experience disrupted when the server restarts.
