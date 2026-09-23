@@ -29,7 +29,17 @@ const MODEL_CONFIG: AiModelConfig = {
 };
 
 const GADGET_SERVER = `\
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+export class ExportHandler extends WorkerEntrypoint {
+  async getExportFormats(gadget) {
+    const viewer = await gadget.viewer();
+    return [{ id: "viewer", label: "Viewer " + (viewer?.id ?? "none"), mode: "server",
+              contentType: "application/json", fileExtension: ".json" }];
+  }
+  async export(gadget, id) {
+    return new Response(JSON.stringify(await gadget.viewer())).body;
+  }
+}
 export class Gadget extends DurableObject {
   async whoAmI() {
     return this.env.TEST_THING.whoAmI();
@@ -40,6 +50,9 @@ export class Gadget extends DurableObject {
   }
   async replayStashed() {
     return this.stashed.whoAmI();
+  }
+  async viewer() {
+    return this.env.VIEWER ?? null;
   }
 }
 `;
@@ -197,6 +210,7 @@ async function connectGadget(
       whoAmI(): Promise<string>;
       stashBinding(): Promise<string>;
       replayStashed(): Promise<string>;
+      viewer(): Promise<{ id: string; name: string } | null>;
     }> {
   const gadget = await overseer.getGadget(gadgetId);
   // The gadget's own methods are not in GadgetClient's type; the fixture server defines them.
@@ -204,6 +218,7 @@ async function connectGadget(
     whoAmI(): Promise<string>;
     stashBinding(): Promise<string>;
     replayStashed(): Promise<string>;
+    viewer(): Promise<{ id: string; name: string } | null>;
   }>;
 }
 
@@ -253,6 +268,73 @@ describe("session actor", () => {
       }
       expect(seen.filter(label => label === shared.aliceLabel)).toHaveLength(20);
       expect(seen.filter(label => label === shared.bobLabel)).toHaveLength(20);
+    });
+  });
+
+  it.concurrent("tells a gadget facet call who the viewer is, with no cross-talk", async () => {
+    await withSession(async publicApi => {
+      const shared = await shareBoundGadget(publicApi, "viewer", "use");
+      await shared.bobApi.setOwnDisplayName("Bob Builder");
+      const aliceId = (await shared.aliceApi.whoami()).id;
+      const bobId = (await shared.bobApi.whoami()).id;
+      using aliceWorkspace = await aliceOpens(shared);
+      using bobWorkspace = await bobOpens(shared);
+      using aliceGadget = await connectGadget(aliceWorkspace, shared.gadgetId);
+      using bobGadget = await connectGadget(bobWorkspace, shared.gadgetId);
+
+      for (let i = 0; i < 10; i++) {
+        const [alice, bob] = await Promise.all([aliceGadget.viewer(), bobGadget.viewer()]);
+        expect(alice).toEqual({ id: aliceId, name: aliceId });
+        expect(bob).toEqual({ id: bobId, name: "Bob Builder" });
+      }
+    });
+  });
+
+  it.concurrent("runs a use collaborator's export as that collaborator", async () => {
+    await withSession(async publicApi => {
+      const shared = await shareBoundGadget(publicApi, "export", "use");
+      await shared.bobApi.setOwnDisplayName("Bob Builder");
+      const bobId = (await shared.bobApi.whoami()).id;
+      using bobWorkspace = await bobOpens(shared);
+      using gadget = await bobWorkspace.getGadget(shared.gadgetId);
+
+      const formats = await gadget.getExportFormats();
+      expect(formats).toEqual([expect.objectContaining({ id: "viewer", label: `Viewer ${bobId}` })]);
+      const exported = await new Response(await gadget.export("viewer")).text();
+      expect(JSON.parse(exported)).toEqual({ id: bobId, name: "Bob Builder" });
+    });
+  });
+
+  it.concurrent("refuses a caller's own actor bag through __invoke", async () => {
+    await withSession(async publicApi => {
+      const shared = await shareBoundGadget(publicApi, "forge", "use");
+      using bobWorkspace = await bobOpens(shared);
+      using bobGadget = await connectGadget(bobWorkspace, shared.gadgetId);
+      // The shim's entry point, reached from the client: a forged VIEWER, and an empty bag that
+      // would leave the bindings to the load-time env with no person behind them.
+      const forger = bobGadget as unknown as {
+        __invoke(bag: object, method: string, args: unknown[]): Promise<unknown>;
+      };
+      // Awaited inside a plain async function: handing expect() the RPC promise itself lets its
+      // property probes pipeline as calls, which fail for reasons of their own.
+      const invoke = async (bag: object, method: string, args: unknown[]) =>
+          await forger.__invoke(bag, method, args);
+      await expect(invoke({ VIEWER: { id: "someone", name: "Someone" } }, "viewer", []))
+          .rejects.toThrow(/__invoke/);
+      await expect(invoke({}, "whoAmI", [])).rejects.toThrow(/__invoke/);
+      await expect(bobGadget.viewer()).resolves.toMatchObject({ id: (await shared.bobApi.whoami()).id });
+    });
+  });
+
+  it.concurrent("reserves VIEWER as a gadget binding name", async () => {
+    await withSession(async publicApi => {
+      const shared = await shareBoundGadget(publicApi, "reserved");
+      using aliceWorkspace = await aliceOpens(shared);
+      using gadget = await aliceWorkspace.getGadget(shared.gadgetId);
+      await expect((async () => await gadget.bind("VIEWER", shared.gatekeeperId))())
+          .rejects.toThrow(/reserved/);
+      await expect((async () => await gadget.renameBinding("TEST_THING", "VIEWER"))())
+          .rejects.toThrow(/reserved/);
     });
   });
 
