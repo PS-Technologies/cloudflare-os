@@ -54,6 +54,7 @@ const mocks = vi.hoisted(() => {
           },
           getGadget: () => disposable,
           listHooks: async () => [],
+          getBrowserPane: async () => ({ state: 'none' }),
           subscribeToConsoleLogs: async () => disposable,
         },
       },
