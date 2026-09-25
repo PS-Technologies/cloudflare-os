@@ -782,6 +782,121 @@ export type GatekeeperSessionActor = {
 };
 
 /**
+ * Who is looking at the Workshop's Browser pane. The Overseer derives it from the signed-in
+ * session, never from the client. `controllerId` is the same opaque key a browser gatekeeper
+ * records for the person a handoff was started for ("owner", or "observer:" plus the id
+ * `addObserver` gave a collaborator), so the gatekeeper can tell the person who is driving from
+ * another member. Absent when the viewer has no opaque key yet.
+ */
+export type BrowserPaneViewer = {
+  controllerId?: string;
+};
+
+/** What the Browser pane shows about the workspace's shared browser. */
+export type BrowserPaneStatus = {
+  /** The Browser Run session this workspace holds, if one has been launched. */
+  sessionId?: string;
+  /**
+   * "none": no browser yet; "idle": the agent may use the browser; "waiting": a person is driving
+   * it (a handoff is active).
+   */
+  state: "none" | "idle" | "waiting";
+  /** What the agent asked the person to do, while waiting. */
+  instructions?: string;
+  /** When the handoff ends on its own, as ISO-8601, while waiting. */
+  endsAt?: string;
+  /** True when the viewer is the person the handoff was started for. */
+  youControl?: boolean;
+  /**
+   * The browser's page tabs in the order they opened, when the gatekeeper can list them (absent
+   * otherwise: the pane then shows one tab). A sign-in popup or a page the agent opened in a new
+   * tab appears here.
+   */
+  tabs?: BrowserPaneTab[];
+  /**
+   * The tab in front, when known. Chrome paints only that one: another tab shows in Live View as a
+   * blank box, so the pane shows a watcher a note instead. Present with `tabs`, when known.
+   */
+  frontTabId?: string;
+  /**
+   * The tab to show unless the viewer picks another: the one in front, else the handoff's page.
+   * Absent when neither is known, and the link then lets Browser Run choose. Present with `tabs`.
+   */
+  tabId?: string;
+};
+
+/**
+ * One page tab of the shared browser. Only the page's title and host leave the gatekeeper, never
+ * its full address, which can carry a sign-in code.
+ */
+export type BrowserPaneTab = {
+  /** Opaque id; pass it back in `BrowserPaneLinkRequest.tabId` to frame this tab. */
+  id: string;
+  /** The page's title; empty when it has none. */
+  title: string;
+  /** The page's host; empty for a blank or internal page. */
+  host: string;
+};
+
+/**
+ * What the Browser pane asks its status for. The workspace's own probes (on focus, at a turn's end)
+ * need only the state; the open pane also asks for the tabs, which cost a call to Browser Run.
+ */
+export type BrowserPaneStatusRequest = {
+  tabs?: boolean;
+};
+
+/**
+ * What the Browser pane asks a link for. Neither field affects who may drive: the gatekeeper
+ * decides that from the viewer alone.
+ */
+export type BrowserPaneLinkRequest = {
+  /**
+   * A tab from `BrowserPaneStatus.tabs`; the default tab when absent or no longer open. For the
+   * person in control, the tab is brought to the front, since they are driving; never for anyone
+   * else, who must not change the agent's browser.
+   */
+  tabId?: string;
+  /**
+   * Cloudflare's developer tools for the tab (console, network) instead of the page. They can run
+   * JavaScript in the page, so only the person in control gets them, for no longer than their turn;
+   * anyone else gets their ordinary watch link.
+   */
+  developer?: boolean;
+};
+
+/**
+ * A fresh link to the workspace's shared browser. `url` is on the deployment's own hostname and
+ * redirects to the Live View, so the Live View credential never reaches the page that frames
+ * it. `access` is what the link lets its viewer do: "control" (drive the tab) goes only to the
+ * person an active handoff was started for; everyone else, and every member while the agent
+ * drives, gets "watch" (a read-only Live View). `tabId` is the tab it frames, when known;
+ * `developer` is set only on a developer-tools link, which only "control" can be. A "control" link
+ * expires when the person's turn does. "disconnected" means the recorded session is gone; its
+ * sign-in is gone with it. "unavailable" means Browser Run could not answer for now (busy, failing,
+ * or the browser's connection in use); trying again later may work. "watch-unavailable" means the
+ * viewer may only watch and the deployment cannot mint watch-only links (Cloudflare offers them
+ * only through its REST API, which needs a token the operator has not installed); no link is
+ * issued rather than an interactive one.
+ */
+export type BrowserPaneLink =
+  | {
+    ok: true; sessionId: string; url: string; expiresAt: string; access: "control" | "watch";
+    tabId?: string; developer?: true;
+  }
+  | { ok: false; reason: "no-session" | "disconnected" | "unavailable" | "watch-unavailable" };
+
+/**
+ * Host-only methods a browser gatekeeper's facet offers the Workshop for its Browser pane. The
+ * Overseer calls them for a signed-in workspace member, never through the agent's session: they
+ * spend no agent budget and record no observation.
+ */
+export interface BrowserPaneHost {
+  paneStatus(viewer: BrowserPaneViewer, request?: BrowserPaneStatusRequest): Promise<BrowserPaneStatus>;
+  paneLink(viewer: BrowserPaneViewer, request?: BrowserPaneLinkRequest): Promise<BrowserPaneLink>;
+}
+
+/**
  * Interface exposed by a Gatekeeper instance implementing a specific resource binding on a
  * specific Gadget.
  *
