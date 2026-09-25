@@ -101,6 +101,8 @@ const DENIED_OVERSEER: Record<Exclude<keyof Overseer, keyof RpcTarget | UseSurfa
   approveAction: ws => ws.approveAction(0),
   rejectAction: ws => ws.rejectAction(0),
   listHooks: ws => ws.listHooks(),
+  getBrowserPane: ws => ws.getBrowserPane(),
+  mintBrowserPaneLink: ws => ws.mintBrowserPaneLink(),
   enableHook: ws => ws.enableHook(0),
   disableHook: ws => ws.disableHook(0),
   deleteHook: ws => ws.deleteHook(0),
