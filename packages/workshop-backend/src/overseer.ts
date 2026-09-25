@@ -4,7 +4,7 @@ import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, Work
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
-import { type AgentCatalog, Gatekeeper, type GatekeeperSessionActor, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
+import { type AgentCatalog, type BrowserPaneHost, type BrowserPaneLink, type BrowserPaneStatus, type BrowserPaneViewer, Gatekeeper, type GatekeeperSessionActor, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
   RpcTarget as NativeRpcTarget, restore,
@@ -321,6 +321,31 @@ type GatekeeperRecord = {
 function gatekeeperVendorId(record: GatekeeperRecord | undefined): string | undefined {
   let spec = record?.creationSpec;
   return spec && "vendorId" in spec ? spec.vendorId.toLowerCase() : undefined;
+}
+
+// The Browser pane serves the workspace's one ambient Browser Run connection: the capsule
+// ensureAmbientCapsules provisions from the owner's "browser" singleton account. Vendor ids come
+// from the GATEKEEPER_ binding name (see user.ts), so the match is by that id, not by URL.
+export const BROWSER_PANE_VENDOR_ID = "browser";
+
+export function findAmbientBrowserGatekeeper<T extends Pick<GatekeeperRecord, "id" | "creationSpec">>(
+    records: Iterable<T>): T | undefined {
+  for (let record of records) {
+    let spec = record.creationSpec;
+    if (spec?.type === "ambient" && spec.vendorId.toLowerCase() === BROWSER_PANE_VENDOR_ID) {
+      return record;
+    }
+  }
+  return undefined;
+}
+
+// The pane viewer's opaque key, mirroring what the browser gatekeeper records as a handoff's
+// controller from the session actor (patch 0007): the owner is "owner"; a collaborator is keyed by
+// the id addObserver gave them. Never derived from anything the client sends.
+export function browserPaneControllerId(
+    isOwner: boolean, observerId: string | undefined): string | undefined {
+  if (isOwner) return "owner";
+  return observerId === undefined ? undefined : `observer:${observerId}`;
 }
 
 // A binding edge from one gadget to a target workpiece (today always a gatekeeper), stored in
@@ -5505,6 +5530,23 @@ class OverseerImpl implements AgentHooks {
     } else {
       throw new Error("Hook is not connected.");
     }
+  }
+
+  // The Browser pane's host facet, or undefined when this workspace has no Browser Run
+  // connection. Same optional-methods-on-a-stub view as CatalogGatekeeperFacet.
+  browserPaneHost(): Fetcher<Gatekeeper<any> & BrowserPaneHost> | undefined {
+    let record = findAmbientBrowserGatekeeper(this.storage.gatekeepers.list());
+    if (!record) return undefined;
+    this.assertGatekeeperUsable(record.id);
+    return this.getGatekeeperFacet(record.id) as unknown as
+        Fetcher<Gatekeeper<any> & BrowserPaneHost>;
+  }
+
+  browserPaneViewer(profileId: string, isOwner: boolean): BrowserPaneViewer {
+    return {
+      controllerId: browserPaneControllerId(
+          isOwner, this.storage.observers.get(profileId)?.observerId),
+    };
   }
 
   // `cls` is for the one caller that has the class in hand but has deliberately not published the
@@ -11599,6 +11641,20 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     return this.impl.deleteHook(id);
   }
 
+  // The Browser pane. Membership was checked by open(); the viewer is derived from this session's
+  // profile, so neither call takes anything from the client.
+  async getBrowserPane(): Promise<BrowserPaneStatus> {
+    let host = this.impl.browserPaneHost();
+    if (!host) return {state: "none"};
+    return host.paneStatus(this.impl.browserPaneViewer(this.clientProfileId, this.isOwner));
+  }
+
+  async mintBrowserPaneLink(): Promise<BrowserPaneLink> {
+    let host = this.impl.browserPaneHost();
+    if (!host) return {ok: false, reason: "no-session"};
+    return host.paneLink(this.impl.browserPaneViewer(this.clientProfileId, this.isOwner));
+  }
+
   // Resume a turn suspended on awaitDecision once all awaited actions from that turn are approved.
   // Scoping to the current turn prevents older rejected actions from blocking future resumes.
   async #maybeResumeAfterActionDecision(chatId: number): Promise<void> {
@@ -12734,6 +12790,8 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   async approveAction(_id: number): Promise<void> { this.#deny(); }
   async rejectAction(_id: number): Promise<void> { this.#deny(); }
   async listHooks(): Promise<BoundHookInfo[]> { this.#deny(); }
+  async getBrowserPane(): Promise<BrowserPaneStatus> { this.#deny(); }
+  async mintBrowserPaneLink(): Promise<BrowserPaneLink> { this.#deny(); }
   async enableHook(_id: number): Promise<void> { this.#deny(); }
   async disableHook(_id: number): Promise<void> { this.#deny(); }
   async deleteHook(_id: number): Promise<void> { this.#deny(); }

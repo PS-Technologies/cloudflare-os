@@ -1673,6 +1673,9 @@ export type ActionLogEntry = {
   // are enabled/disabled, which the user can freely toggle as often as they want.
 });
 
+import type { BrowserPaneLink, BrowserPaneStatus } from "./gatekeeper";
+export type { BrowserPaneLink, BrowserPaneStatus } from "./gatekeeper";
+
 export type BoundHookInfo = {
   id: number;
 
@@ -1946,6 +1949,22 @@ export interface Overseer extends RpcTarget {
    * BoundHookInfo.gadgetId), so a per-gadget view must filter on that.
    */
   listHooks(): Promise<BoundHookInfo[]>;
+
+  /**
+   * The Browser pane's view of the workspace's shared Browser Run session: whether one exists and
+   * whether a person is driving it. This reads the Browser connection's own record, not an agent
+   * session, so it spends no agent budget and logs no observation. `state` is "none" when the
+   * workspace has no Browser connection or no browser has been launched in it yet.
+   */
+  getBrowserPane(): Promise<BrowserPaneStatus>;
+
+  /**
+   * Mint a fresh link to the workspace's shared browser for the caller, for the Browser pane's
+   * frame or a new tab. The link is on this deployment's own hostname and redirects to the Live
+   * View, so its credential stays out of the page. Every call mints a new link; the pane keeps the
+   * one it has until the session changes or the frame disconnects.
+   */
+  mintBrowserPaneLink(): Promise<BrowserPaneLink>;
 
   /** Enable the hook with the given ID. Callbacks will begin flowing. */
   enableHook(id: number): Promise<void>;

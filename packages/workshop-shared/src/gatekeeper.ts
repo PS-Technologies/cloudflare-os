@@ -782,6 +782,59 @@ export type GatekeeperSessionActor = {
 };
 
 /**
+ * Who is looking at the Workshop's Browser pane. The Overseer derives it from the signed-in
+ * session, never from the client. `controllerId` is the same opaque key a browser gatekeeper
+ * records for the person a handoff was started for ("owner", or "observer:" plus the id
+ * `addObserver` gave a collaborator), so the gatekeeper can tell the person who is driving from
+ * another member. Absent when the viewer has no opaque key yet.
+ */
+export type BrowserPaneViewer = {
+  controllerId?: string;
+};
+
+/** What the Browser pane shows about the workspace's shared browser. */
+export type BrowserPaneStatus = {
+  /** The Browser Run session this workspace holds, if one has been launched. */
+  sessionId?: string;
+  /**
+   * "none": no browser yet; "idle": the agent may use the browser; "waiting": a person is driving
+   * it (a handoff is active).
+   */
+  state: "none" | "idle" | "waiting";
+  /** What the agent asked the person to do, while waiting. */
+  instructions?: string;
+  /** When the handoff ends on its own, as ISO-8601, while waiting. */
+  endsAt?: string;
+  /** True when the viewer is the person the handoff was started for. */
+  youControl?: boolean;
+};
+
+/**
+ * A fresh link to the workspace's shared browser. `url` is on the deployment's own hostname and
+ * redirects to the Live View, so the Live View credential never reaches the page that frames
+ * it. `access` is what the link lets its viewer do: "control" (drive the tab) goes only to the
+ * person an active handoff was started for; everyone else, and every member while the agent
+ * drives, gets "watch" (a read-only Live View). "disconnected" means the recorded session could
+ * not be reached; its sign-in is gone. "watch-unavailable" means the viewer may only watch and
+ * the deployment cannot mint watch-only links (Cloudflare offers them only through its REST API,
+ * which needs a token the operator has not installed); no link is issued rather than an
+ * interactive one.
+ */
+export type BrowserPaneLink =
+  | { ok: true; sessionId: string; url: string; expiresAt: string; access: "control" | "watch" }
+  | { ok: false; reason: "no-session" | "disconnected" | "watch-unavailable" };
+
+/**
+ * Host-only methods a browser gatekeeper's facet offers the Workshop for its Browser pane. The
+ * Overseer calls them for a signed-in workspace member, never through the agent's session: they
+ * spend no agent budget and record no observation.
+ */
+export interface BrowserPaneHost {
+  paneStatus(viewer: BrowserPaneViewer): Promise<BrowserPaneStatus>;
+  paneLink(viewer: BrowserPaneViewer): Promise<BrowserPaneLink>;
+}
+
+/**
  * Interface exposed by a Gatekeeper instance implementing a specific resource binding on a
  * specific Gadget.
  *

@@ -4,8 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
 
-    <!-- Prevents Gadget UI frames from navigating away from their srcdoc. DO NOT REMOVE. -->
-    <meta http-equiv="Content-Security-Policy" content="frame-src srcdoc:;">
+    <!-- Prevents Gadget UI frames from navigating away from their srcdoc. DO NOT REMOVE.
+         'self' and the Live View origin are for the Browser pane: its frame loads a link on this
+         origin that redirects to the Live View. -->
+    <meta http-equiv="Content-Security-Policy" content="frame-src srcdoc: 'self' https://live.browser.run;">
 
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Cloudflare OS</title>
