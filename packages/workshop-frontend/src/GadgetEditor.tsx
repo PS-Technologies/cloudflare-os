@@ -13,6 +13,7 @@ import {
   DotsThree,
   GitBranch,
   Pulse,
+  Globe,
   type Icon,
 } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget } from 'capnweb'
@@ -39,6 +40,7 @@ import GadgetUI from './GadgetUI'
 import GadgetUseView from './GadgetUseView'
 import Connections from './Connections'
 import Activity, { type ActivityView } from './Activity'
+import BrowserPane from './BrowserPane'
 import { CountBadge } from './components/CountBadge'
 import ActivityNotifications from './ActivityNotifications'
 import WorkpiecePicker, {
@@ -164,6 +166,9 @@ type WorkspaceView =
   // `appId` is absent only while lazily migrating the legacy "open" value.
   | { mode: 'app'; appId?: WorkpieceId }
   | { mode: 'activity' }
+  // The workspace's shared browser (see BrowserPane). A workspace-level view like Activity: it
+  // opens the right pane on its own, with or without a gadget.
+  | { mode: 'browser' }
 
 function formatHeaderCost(cost: number) {
   if (cost === 0) return '$0'
@@ -517,6 +522,15 @@ export default function GadgetEditor() {
   const activityReturnViewRef = useRef<WorkspaceView | null>(null)
   const [activityView, setActivityView] = useState<ActivityView>('history')
   const [activityClosing, setActivityClosing] = useState(false)
+  // Whether the agent has a browser in this workspace, so the Browser entry only shows once there
+  // is something to look at. Probed once the workspace is ready, again on focus, and again each
+  // time an agent turn ends in the open chat (`browserProbeKey`), so a handoff the agent just
+  // started lights the entry up while the person is still reading the reply. No polling.
+  const [browserAvailable, setBrowserAvailable] = useState(false)
+  const [browserProbeKey, setBrowserProbeKey] = useState(0)
+  // Whether the last probe saw a person driving: the not-waiting to waiting edge is what opens
+  // the pane, once per handoff.
+  const browserWaitingRef = useRef(false)
   const [shareModalOpen, setShareModalOpen] = useState(false)
   const [blueprintModalOpen, setBlueprintModalOpen] = useState(false)
   const [previewMode, _setPreviewMode] = useState(false)
@@ -855,11 +869,44 @@ export default function GadgetEditor() {
   const hasAnyApps = allGadgets.length > 0 || allWorktrees.length > 0
   const hasVisibleWorkpieces = visibleWorkpieces.length > 0
   const showingActivity = workspaceView?.mode === 'activity'
+  const showingBrowser = workspaceView?.mode === 'browser'
   const showFullEditor = layoutModeReady && (
-    showingActivity || (hasVisibleWorkpieces && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
+    showingActivity || showingBrowser
+      || (hasVisibleWorkpieces && (workspaceView === null ? !simpleMode : workspaceView.mode === 'app'))
   )
   const showOutputRail = layoutModeReady && hasAnyApps && !showFullEditor
   const paneShowsActivity = showingActivity || activityClosing
+  const paneShowsBrowser = showingBrowser
+  // Either workspace-level view: the pane then shows no gadget chrome.
+  const paneShowsWorkspaceView = paneShowsActivity || paneShowsBrowser
+  const openBrowserRef = useRef<() => void>(() => {})
+  const workspaceViewRef = useRef(workspaceView)
+  workspaceViewRef.current = workspaceView
+  useEffect(() => {
+    if (!overseerStub || !workpiecesReady) return
+    let cancelled = false
+    const probe = () => {
+      overseerStub.getBrowserPane().then(status => {
+        if (cancelled) return
+        setBrowserAvailable(status.state !== 'none')
+        const waiting = status.state === 'waiting'
+        const handoffStarted = waiting && !browserWaitingRef.current
+        browserWaitingRef.current = waiting
+        // A handoff just started: bring the browser to the person, once, on desktop, unless the
+        // pane is showing a gadget they are using. On phones the Browser tab appearing is enough.
+        if (handoffStarted && workspaceViewRef.current?.mode !== 'app'
+            && window.matchMedia('(min-width: 768px)').matches) {
+          openBrowserRef.current()
+        }
+      }).catch(() => {})
+    }
+    probe()
+    window.addEventListener('focus', probe)
+    return () => {
+      cancelled = true
+      window.removeEventListener('focus', probe)
+    }
+  }, [overseerStub, workpiecesReady, browserProbeKey])
   useEffect(() => {
     if (!activityClosing) return
     const timeout = window.setTimeout(() => setActivityClosing(false), WORKSPACE_TRANSITION_MS)
@@ -957,23 +1004,38 @@ export default function GadgetEditor() {
     setWorkspaceVisibility('open', urlWorkpieceId)
   }, [workpiecesReady, urlWorkpieceId, visibleWorkpieces, setWorkspaceVisibility])
 
+  // Activity and Browser share the return-view slot: switching between them keeps the view the
+  // person was in before either opened.
   const openActivity = useCallback((initialView: ActivityView) => {
     setWorkspaceTransitionEnabled(true)
     setActivityClosing(false)
-    if (workspaceView?.mode !== 'activity') activityReturnViewRef.current = workspaceView
+    if (workspaceView?.mode !== 'activity' && workspaceView?.mode !== 'browser') {
+      activityReturnViewRef.current = workspaceView
+    }
     setActivityView(initialView)
     setWorkspaceView({ mode: 'activity' })
   }, [workspaceView])
 
+  const openBrowser = useCallback(() => {
+    setWorkspaceTransitionEnabled(true)
+    setActivityClosing(false)
+    if (workspaceView?.mode !== 'activity' && workspaceView?.mode !== 'browser') {
+      activityReturnViewRef.current = workspaceView
+    }
+    setBrowserAvailable(true)
+    setWorkspaceView({ mode: 'browser' })
+  }, [workspaceView])
+  openBrowserRef.current = openBrowser
+
   const closeWorkspacePane = useCallback(() => {
-    if (workspaceView?.mode !== 'activity') {
+    if (workspaceView?.mode !== 'activity' && workspaceView?.mode !== 'browser') {
       setWorkspaceVisibility('closed')
       return
     }
     setWorkspaceTransitionEnabled(true)
     const returnView = activityReturnViewRef.current
-    const returnShowsPane = hasVisibleWorkpieces && (returnView?.mode === 'app'
-      || (returnView === null && !simpleMode))
+    const returnShowsPane = returnView?.mode === 'browser' || (hasVisibleWorkpieces && (
+      returnView?.mode === 'app' || (returnView === null && !simpleMode)))
     setActivityClosing(!returnShowsPane)
     setWorkspaceView(returnView)
     activityReturnViewRef.current = null
@@ -1053,6 +1115,7 @@ export default function GadgetEditor() {
   const handleAgentActiveChange = useCallback((chatId: number, isActive: boolean) => {
     if (chatId !== selectedChatIdRef.current) return
     setIsAgentActive(isActive)
+    if (!isActive) setBrowserProbeKey(k => k + 1)
     if (isActive) {
       turnOutputRef.current = {
         chatId,
@@ -1120,7 +1183,7 @@ export default function GadgetEditor() {
       const leavingPendingApp = pendingChatId !== undefined && chatId !== pendingChatId
       if (leavingPendingApp) {
         setWorkspaceTransitionEnabled(true)
-        if (workspaceView?.mode === 'activity') {
+        if (workspaceView?.mode === 'activity' || workspaceView?.mode === 'browser') {
           activityReturnViewRef.current = { mode: 'chat' }
         } else {
           setWorkspaceView({ mode: 'chat' })
@@ -1459,9 +1522,9 @@ export default function GadgetEditor() {
   // The mobile bar's workpiece tab: a gadget's preview, or -- since a worktree has nothing to
   // preview -- its code. The "More" menu lights up for whatever else the pane is showing.
   const mobilePrimaryTab: RightTab = selectedWorkpieceSummary?.type === 'worktree' ? 'code' : 'app'
-  const mobilePreviewActive = showFullEditor && !paneShowsActivity && activeTab === 'app'
-  const mobilePrimaryActive = showFullEditor && !paneShowsActivity && activeTab === mobilePrimaryTab
-  const mobileMoreActive = showFullEditor && !paneShowsActivity && activeTab !== mobilePrimaryTab
+  const mobilePreviewActive = showFullEditor && !paneShowsWorkspaceView && activeTab === 'app'
+  const mobilePrimaryActive = showFullEditor && !paneShowsWorkspaceView && activeTab === mobilePrimaryTab
+  const mobileMoreActive = showFullEditor && !paneShowsWorkspaceView && activeTab !== mobilePrimaryTab
 
   // ── always render the full two-pane edit layout; preview overlays on top ──────
   return (
@@ -1561,6 +1624,18 @@ export default function GadgetEditor() {
             restricted={metadata?.containsRestrictedData === true}
           />
 
+          {(browserAvailable || paneShowsBrowser) && (
+            <WorkshopIconButton
+              onClick={openBrowser}
+              title="Browser"
+              aria-label="Open browser pane"
+              aria-current={paneShowsBrowser ? 'page' : undefined}
+              className={paneShowsBrowser ? 'bg-kumo-tint text-kumo-default' : undefined}
+            >
+              <Globe size={15} />
+            </WorkshopIconButton>
+          )}
+
           {showReconnecting && <ReconnectingChip />}
 
           <WorkshopIconButton
@@ -1641,6 +1716,18 @@ export default function GadgetEditor() {
             <span className="ml-1.5 h-1.5 w-1.5 rounded-full bg-kumo-brand" />
           )}
         </button>
+        {(browserAvailable || paneShowsBrowser) && (
+          <button
+            type="button"
+            onClick={openBrowser}
+            aria-current={paneShowsBrowser ? 'page' : undefined}
+            className={`flex h-9 min-w-0 flex-1 items-center justify-center rounded-lg px-3 text-[14px] font-medium ${
+              paneShowsBrowser ? 'bg-kumo-tint text-kumo-default' : 'text-kumo-subtle'
+            }`}
+          >
+            Browser
+          </button>
+        )}
         <DropdownMenu>
           <DropdownMenu.Trigger
             render={
@@ -1837,6 +1924,8 @@ export default function GadgetEditor() {
             <div className="flex min-w-0 flex-1 items-center overflow-hidden">
               {paneShowsActivity ? (
                 <PaneLabel icon={Pulse} title="Activity" />
+              ) : paneShowsBrowser ? (
+                <PaneLabel icon={Globe} title="Browser" />
               ) : visibleWorkpieces.length > 1 ? (
                 <PaneWorkpieceTabs
                   gadgets={visibleWorkpieces}
@@ -1854,6 +1943,7 @@ export default function GadgetEditor() {
             </div>
 
             <div className="flex flex-shrink-0 items-center gap-1.5">
+              {!paneShowsBrowser && (
               <div className="flex items-center rounded-lg border border-kumo-line p-0.5">
                 {paneShowsActivity
                   ? ACTIVITY_TABS.map(tab => (
@@ -1874,8 +1964,9 @@ export default function GadgetEditor() {
                     />
                   ))}
               </div>
+              )}
 
-              {!paneShowsActivity && (
+              {!paneShowsWorkspaceView && (
                 <GadgetExportMenu
                   gadget={selectedGadgetStub}
                   gadgetTitle={selectedGadgetSummary?.title ?? 'Gadget'}
@@ -1883,7 +1974,7 @@ export default function GadgetEditor() {
                 />
               )}
 
-              {!paneShowsActivity && selectedWorkpieceSummary?.type !== 'worktree' && (
+              {!paneShowsWorkspaceView && selectedWorkpieceSummary?.type !== 'worktree' && (
                 <WorkshopIconButton
                   aria-label="Enter full screen"
                   title={activeTab === 'app' && !previewMode
@@ -1899,7 +1990,9 @@ export default function GadgetEditor() {
               <WorkshopIconButton
                 aria-label={paneShowsActivity
                   ? 'Close activity'
-                  : selectedWorkpieceSummary?.type === 'worktree' ? 'Close worktree pane' : 'Close gadget pane'}
+                  : paneShowsBrowser
+                    ? 'Close browser'
+                    : selectedWorkpieceSummary?.type === 'worktree' ? 'Close worktree pane' : 'Close gadget pane'}
                 title="Close"
                 onClick={closeWorkspacePane}
               >
@@ -1934,7 +2027,12 @@ export default function GadgetEditor() {
                 />
               </div>
             )}
-            <div className={paneShowsActivity ? 'hidden' : 'contents'}>
+            {paneShowsBrowser && (
+              <div className="min-h-0 flex-1">
+                <BrowserPane overseer={overseer.stub} refreshKey={browserProbeKey} />
+              </div>
+            )}
+            <div className={paneShowsWorkspaceView ? 'hidden' : 'contents'}>
             <div
               ref={fullscreenOverlayRef}
               tabIndex={isGadgetFullscreen ? -1 : undefined}
