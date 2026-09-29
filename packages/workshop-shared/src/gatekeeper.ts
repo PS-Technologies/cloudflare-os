@@ -766,6 +766,39 @@ export interface GatekeeperUser extends WorkerEntrypoint {
 export interface GatekeeperUserVerifier extends WorkerEntrypoint {}
 
 /**
+ * The person a binding session acts for. The overseer passes this into `Gatekeeper.startSession`
+ * on every person-driven path (agent turn, gadget UI, direct binding use) and omits it for
+ * headless callers.
+ *
+ * Identity is conveyed only via `verifier`, which the overseer returns only to the vendor that
+ * minted it, with one exception below. `observerId` is the opaque handle from `addObserver` when
+ * the person is a stored collaborator; owners have none. `verifier` is absent when the person is
+ * named but the account they chose for this binding is gone — gatekeepers that execute per-user
+ * should then refuse rather than fall back to the binding's creator.
+ *
+ * The exception: the workspace's Browser Run connection (the ambient "browser" vendor) is also told
+ * who asked (`profileId`) and where (`externalMessageKey`), so its handoff notice can reach that
+ * person. No other gatekeeper's actor ever carries either field. Neither grants anything:
+ * authorization stays with `verifier`.
+ */
+export type GatekeeperSessionActor = {
+  observerId?: string;
+  verifier?: Fetcher<GatekeeperUserVerifier>;
+  /**
+   * Browser Run connection only: the person's user id, as `AiChatAuthorInfo.id` carries it, their
+   * sign-in email under Access.
+   */
+  profileId?: string;
+  /**
+   * Browser Run connection only, and only for an agent turn that answers a message a chat gateway
+   * submitted through `ExternalMessageGateway` while that turn's reply is still owed: the message's
+   * key as the Workshop records it, `<source>:<messageKey>`, `source` being the gateway binding's
+   * own prop.
+   */
+  externalMessageKey?: string;
+};
+
+/**
  * Interface exposed by a Gatekeeper instance implementing a specific resource binding on a
  * specific Gadget.
  *
@@ -811,8 +844,16 @@ export interface Gatekeeper<Session> extends DurableObject {
    * dependent actions. That said, there is no strict requirement that a gatekeeper does such
    * simulation -- it is really up to the gatekeeper author to decide what is appropriate for the
    * particular API.
+   *
+   * `actor` is the person this session acts for; absent for headless callers (hooks, restore,
+   * callback-initiated turns). Gatekeepers that execute under a per-user credential should refuse
+   * rather than fall back to the binding's creator; others may ignore it. Cap'n Web drops a surplus
+   * argument, so a one-parameter implementation stays valid.
    */
-  startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<Session>;
+  startSession(
+    approvalQueue: RpcStub<ApprovalQueue>,
+    actor?: GatekeeperSessionActor,
+  ): Promise<Session>;
 
   /**
    * Bounded, user-specific metadata the agent uses to discover entries reachable through this

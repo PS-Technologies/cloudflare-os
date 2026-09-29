@@ -23,7 +23,8 @@ import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudf
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import type {
   AccountDescription, ActionKind, AgentCatalog, ApprovalQueue, Gatekeeper,
-  GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, ResourceDescription,
+  GatekeeperConnectCallback, GatekeeperSessionActor, GatekeeperUser, GatekeeperUserVerifier,
+  ResourceDescription,
   ResourceConfiguratorFrame, SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
@@ -46,6 +47,10 @@ interface TestThing {
   readValue(): Promise<number>;
   writeValue(value: number): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
+  /** The account label this session is executing as. */
+  whoAmI(): Promise<string>;
+  /** Who the session's actor names, and the external message its agent turn answers. */
+  actorOrigin(): Promise<{ profileId?: string; externalMessageKey?: string }>;
 }
 `;
 
@@ -314,6 +319,8 @@ export interface TestSession {
   /** `incomplete` omits the `descriptionIsComplete` claim, as a summary-only gatekeeper would. */
   writeValue(value: number, opts?: { autoApprovable?: boolean; incomplete?: boolean }): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
+  whoAmI(): Promise<string>;
+  actorOrigin(): Promise<{ profileId?: string; externalMessageKey?: string }>;
 }
 
 @validateRpc()
@@ -323,7 +330,8 @@ class TestSessionTarget extends RpcTarget implements TestSession {
   constructor(
       approvalQueue: RpcStub<ApprovalQueue>,
       private readonly state: DurableObjectStub<TestControl>,
-      private readonly label: string) {
+      private readonly label: string,
+      private readonly origin: { profileId?: string; externalMessageKey?: string } = {}) {
     super();
     this.approvalQueue = approvalQueue.dup();
   }
@@ -361,6 +369,14 @@ class TestSessionTarget extends RpcTarget implements TestSession {
 
   async writeValues(values: number[]): Promise<number[]> {
     return Promise.all(values.map(value => this.writeValue(value)));
+  }
+
+  async whoAmI(): Promise<string> {
+    return this.label;
+  }
+
+  async actorOrigin(): Promise<{ profileId?: string; externalMessageKey?: string }> {
+    return this.origin;
   }
 
   [Symbol.dispose](): void {
@@ -402,9 +418,20 @@ export class TestGatekeeper
     return [SET_VALUE_ACTION_KIND];
   }
 
-  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
-    return new TestSessionTarget(
-        approvalQueue, control(this.ctx.exports), this.ctx.props.label);
+  async startSession(
+      approvalQueue: RpcStub<ApprovalQueue>,
+      actor?: GatekeeperSessionActor): Promise<TestSession> {
+    let label = this.ctx.props.label;
+    if (actor !== undefined) {
+      if (actor.verifier === undefined) {
+        throw new Error("Please reconnect the account.");
+      }
+      label = await (actor.verifier as Fetcher<TestVerifierApi>).identify();
+    }
+    return new TestSessionTarget(approvalQueue, control(this.ctx.exports), label, {
+      ...(actor?.profileId === undefined ? {} : { profileId: actor.profileId }),
+      ...(actor?.externalMessageKey === undefined ? {} : { externalMessageKey: actor.externalMessageKey }),
+    });
   }
 
   /** No discovery index: the ambient fixture is reached through its session alone. */

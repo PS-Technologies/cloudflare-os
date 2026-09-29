@@ -88,6 +88,7 @@ export async function openFakeOverseer(
       joinPresence: () => () => {},
       joinOutputsFanout: () => () => {},
       ensureObserver: async () => {},
+      ensureOwnerActorAccounts: async () => {},
       syncOutputsTo: async () => {},
       // What open() consults for a non-owner's role: the permission-graph lookup and observer
       // verification in one. The sharing manager is still reached, but only to redeem a share key,
