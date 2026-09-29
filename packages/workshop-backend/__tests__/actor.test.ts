@@ -1,0 +1,73 @@
+import { describe, expect, it } from "vitest";
+import { resolveSessionActor } from "../src/actor.js";
+
+const VERIFIER = {} as Fetcher<never>;
+
+describe("resolveSessionActor", () => {
+  it("returns undefined for a headless caller", async () => {
+    await expect(resolveSessionActor(
+        undefined, 1, "test", undefined, undefined, async () => VERIFIER))
+        .resolves.toBeUndefined();
+  });
+
+  it("returns undefined when the binding has no per-user vendor", async () => {
+    await expect(resolveSessionActor(
+        "alice", 1, null, undefined, undefined, async () => VERIFIER))
+        .resolves.toBeUndefined();
+  });
+
+  it("returns observerId without a verifier when no account was chosen", async () => {
+    await expect(resolveSessionActor(
+        "bob", 1, "test", { observerId: "obs-1", accountChoices: {} }, undefined,
+        async () => VERIFIER))
+        .resolves.toEqual({ observerId: "obs-1", profileId: "bob" });
+  });
+
+  it("returns observerId without a verifier when the chosen account is gone", async () => {
+    await expect(resolveSessionActor(
+        "bob", 1, "test", { observerId: "obs-1", accountChoices: { 1: 7 } }, undefined,
+        async () => null))
+        .resolves.toEqual({ observerId: "obs-1", profileId: "bob" });
+  });
+
+  it("returns the collaborator's verifier for their chosen account", async () => {
+    await expect(resolveSessionActor(
+        "bob", 1, "test", { observerId: "obs-1", accountChoices: { 1: 7 } }, undefined,
+        async (profileId, accountId, vendorId) => {
+          expect({ profileId, accountId, vendorId }).toEqual(
+              { profileId: "bob", accountId: 7, vendorId: "test" });
+          return VERIFIER;
+        }))
+        .resolves.toEqual({ observerId: "obs-1", profileId: "bob", verifier: VERIFIER });
+  });
+
+  it("uses the owner's stored choices when there is no observer record", async () => {
+    await expect(resolveSessionActor(
+        "alice", 2, "test", undefined, { accountChoices: { 2: 9 } },
+        async (profileId, accountId, vendorId) => {
+          expect({ profileId, accountId, vendorId }).toEqual(
+              { profileId: "alice", accountId: 9, vendorId: "test" });
+          return VERIFIER;
+        }))
+        .resolves.toEqual({ profileId: "alice", verifier: VERIFIER });
+  });
+
+  it("names the external message an agent turn answers, and nothing when there is none", async () => {
+    await expect(resolveSessionActor(
+        "alice", 2, "test", undefined, { accountChoices: { 2: 9 } }, async () => VERIFIER,
+        "teams:conversation:activity"))
+        .resolves.toStrictEqual({
+          observerId: undefined, profileId: "alice", externalMessageKey: "teams:conversation:activity",
+          verifier: VERIFIER,
+        });
+    await expect(resolveSessionActor(
+        "alice", 2, "test", undefined, { accountChoices: { 2: 9 } }, async () => VERIFIER))
+        .resolves.not.toHaveProperty("externalMessageKey");
+  });
+
+  it("gives a headless caller no actor even when a turn answers an external message", async () => {
+    await expect(resolveSessionActor(
+        undefined, 2, "test", undefined, undefined, async () => VERIFIER, "teams:c:a"))
+        .resolves.toBeUndefined();
+  });
+});
