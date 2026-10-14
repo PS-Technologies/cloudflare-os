@@ -9,20 +9,29 @@ type ConsumeDeviceHandoff = (
   ticket: string,
 ) => Promise<DeviceSessionHandoff | null>;
 
+type DeviceSessionCallbackOptions = {
+  enabled?: boolean;
+  expectedUserDoId?: string;
+};
+
 /**
  * Check browser navigation metadata and a one-use ticket before delivering the envelope to the
  * claimed HTTPS callback. Access installations additionally pass the verified user's DO id;
- * navigation headers alone do not authenticate a direct Worker request.
+ * navigation headers alone do not authenticate a direct Worker request. Disabled unless the
+ * deployment explicitly opts in.
  */
 export async function deviceSessionCallback(
     req: Request,
     consume: ConsumeDeviceHandoff,
-    expectedUserDoId?: string,
+    options: DeviceSessionCallbackOptions = {},
 ): Promise<Response> {
   const headers = {
     "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer",
   };
+  if (options.enabled !== true) {
+    return new Response("Native device-session handoff is disabled.", { status: 403, headers });
+  }
   const origin = new URL(req.url).origin;
   if (req.method !== "POST" || req.headers.get("Origin") !== origin ||
       req.headers.get("Sec-Fetch-Site") !== "same-origin" ||
@@ -48,7 +57,7 @@ export async function deviceSessionCallback(
       typeof ticket !== "string" || !LOWER_HEX_64.test(ticket)) {
     return new Response("Invalid device session request.", { status: 400, headers });
   }
-  if (expectedUserDoId !== undefined && userDoId !== expectedUserDoId) {
+  if (options.expectedUserDoId !== undefined && userDoId !== options.expectedUserDoId) {
     return new Response("Invalid device session owner.", { status: 403, headers });
   }
 

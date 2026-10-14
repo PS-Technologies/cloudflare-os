@@ -79,6 +79,10 @@ declare global {
       // on to avoid locking everyone out).
       DISABLE_PASSWORD_AUTH?: string;
 
+      // Enables transfer of the current authenticated session to the native app. Disabled by
+      // default because Access mode transfers the browser's full Access JWT.
+      ENABLE_DEVICE_SESSION_HANDOFF?: string;
+
       // Enables the Cloudflare free-tier limits + top-up flow when set to "true".
       ENABLE_CLOUDFLARE_LIMITS?: string;
 

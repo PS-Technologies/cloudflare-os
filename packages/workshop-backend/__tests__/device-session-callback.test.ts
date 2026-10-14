@@ -48,15 +48,29 @@ describe("device session callback", () => {
     const start = await user.stageDeviceSessionHandoff(publicKey, state);
     const body = new URLSearchParams({ ...start, state });
 
-    const response = await server.fetch(request(body), env, createExecutionContext());
+    const enabledEnv = { ...env, ENABLE_DEVICE_SESSION_HANDOFF: "true" };
+    const response = await server.fetch(request(body), enabledEnv, createExecutionContext());
     expect(response.status).toBe(303);
     const callback = new URL(response.headers.get("Location")!);
     expect(callback.origin + callback.pathname).toBe("https://os.cloudflare.app/oauthredirect");
     expect(callback.searchParams.get("state")).toBe(state);
     expect(callback.searchParams.get("ciphertext")).toBeTruthy();
 
-    const replay = await server.fetch(request(body), env, createExecutionContext());
+    const replay = await server.fetch(request(body), enabledEnv, createExecutionContext());
     expect(replay.status).toBe(410);
+  });
+
+  it("refuses the Worker route and callback helper when handoff is not explicitly enabled", async () => {
+    const consume = vi.fn().mockResolvedValue(handoff);
+    const body = new URLSearchParams(fields);
+
+    const routeResponse = await server.fetch(request(body), env, createExecutionContext());
+    expect(routeResponse.status).toBe(403);
+    expect(routeResponse.headers.get("Cache-Control")).toBe("no-store");
+
+    const helperResponse = await deviceSessionCallback(request(body), consume);
+    expect(helperResponse.status).toBe(403);
+    expect(consume).not.toHaveBeenCalled();
   });
 
   it("consumes the server-held handoff and redirects to the claimed HTTPS app link", async () => {
@@ -64,6 +78,7 @@ describe("device session callback", () => {
     const response = await deviceSessionCallback(
       request(new URLSearchParams(fields)),
       consume,
+      { enabled: true },
     );
     expect(consume).toHaveBeenCalledWith(userDoId, state, ticket);
     expect(response.status).toBe(303);
@@ -95,7 +110,8 @@ describe("device session callback", () => {
       ])),
       request(new URLSearchParams(fields), { method: "GET" }),
     ]) {
-      expect((await deviceSessionCallback(candidate, consume)).status).toBeGreaterThanOrEqual(400);
+      expect((await deviceSessionCallback(
+        candidate, consume, { enabled: true })).status).toBeGreaterThanOrEqual(400);
     }
     expect(consume).not.toHaveBeenCalled();
   });
@@ -104,6 +120,7 @@ describe("device session callback", () => {
     const response = await deviceSessionCallback(
       request(new URLSearchParams(fields)),
       vi.fn().mockResolvedValue(null),
+      { enabled: true },
     );
     expect(response.status).toBe(410);
   });
@@ -111,7 +128,10 @@ describe("device session callback", () => {
   it("rejects another Access user's handoff before consuming its ticket", async () => {
     const consume = vi.fn().mockResolvedValue(handoff);
     const response = await deviceSessionCallback(
-      request(new URLSearchParams(fields)), consume, "c".repeat(64));
+      request(new URLSearchParams(fields)),
+      consume,
+      { enabled: true, expectedUserDoId: "c".repeat(64) },
+    );
     expect(response.status).toBe(403);
     expect(consume).not.toHaveBeenCalled();
   });
@@ -119,7 +139,12 @@ describe("device session callback", () => {
   it("rejects forged navigation headers without an Access assertion on the Worker route", async () => {
     const response = await server.fetch(
       request(new URLSearchParams(fields)),
-      { ...env, CF_ACCESS_AUD: "audience", CF_ACCESS_ISS: "https://access.example" },
+      {
+        ...env,
+        CF_ACCESS_AUD: "audience",
+        CF_ACCESS_ISS: "https://access.example",
+        ENABLE_DEVICE_SESSION_HANDOFF: "true",
+      },
       {} as ExecutionContext,
     );
     expect(response.status).toBe(403);
@@ -130,6 +155,7 @@ describe("device session callback", () => {
     await expect(deviceSessionCallback(
       request(new URLSearchParams(fields)),
       vi.fn().mockRejectedValue(new Error("storage unavailable")),
+      { enabled: true },
     )).rejects.toThrow("storage unavailable");
   });
 });

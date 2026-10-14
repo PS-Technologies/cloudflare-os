@@ -65,6 +65,13 @@ full scopes and persists the connection).
 
 ## Native app return after installation sign-in
 
+Native device-session handoff is disabled by default. After the installation owner accepts the
+Access-token transfer, set the Workshop Worker variable
+`ENABLE_DEVICE_SESSION_HANDOFF=true`; any other value leaves both
+`AuthenticatedApi.beginDeviceSessionHandoff()` and `POST /api/device-session/callback` disabled.
+Access installations transfer the browser's full Access JWT to the native app, so enabling this
+flag is an explicit deployment security decision.
+
 The native Cloudflare OS shell uses a system authentication session, rather than an embedded web
 view, to sign in to an installation. This is required for identity-provider and security-key flows
 that reject or cannot complete in embedded browsers. The app opens the installation with a fresh
