@@ -5,7 +5,12 @@ import { PublicApi, ROUTER_TAG_PROBE_PATH, VERSION_PATH, AuthenticatedApi, Overs
 import type { UiFeatureFlags } from "@gadgets/workshop-shared/feature-flags";
 import type { UnreadStateScope } from "@gadgets/workshop-shared/api";
 import { backendVersion, getServerConfig } from "./deployment-config.js";
-import { isDeploymentAdmin, isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
+import {
+  getAuthGatekeeperAllowlist,
+  isDeploymentAdmin,
+  isDeviceSessionHandoffEnabled,
+  isPasswordAuthEnabled,
+} from "./auth/config.js";
 import { getAuthVendorBinding } from "./auth/auth-vendors.js";
 import { getUsageInfo } from "./ai-gateway-billing/limits/usage-checker.js";
 import { listConnectedAccounts, selectAccount } from "./ai-gateway-billing/cloudflare/connection-service.js";
@@ -89,6 +94,7 @@ type Env = Cloudflare.Env & {
   // Set these if using Cloudflare Access for authentication, otherwise username/password is used.
   CF_ACCESS_AUD?: string,  // audience
   CF_ACCESS_ISS?: string,  // team URL, i.e. https://<team>.cloudflareaccess.com
+  ENABLE_DEVICE_SESSION_HANDOFF?: string;
   DEV?: boolean;
   FLAGS?: Flagship;
 }
@@ -150,6 +156,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return retryOnDoReset(() => this.#user.whoami());
   }
   async beginDeviceSessionHandoff(publicKey: string, state: string) {
+    if (!isDeviceSessionHandoffEnabled(this.env)) {
+      throw new Error("Native device-session handoff is disabled for this deployment.");
+    }
     if (this.accessSession?.expiresAt !== undefined &&
         this.accessSession.expiresAt <= Date.now()) {
       throw new Error("The Access session has expired. Sign in again before connecting the app.");
@@ -999,6 +1008,12 @@ export default {
     }
 
     if (url.pathname === "/api/device-session/callback") {
+      if (!isDeviceSessionHandoffEnabled(env)) {
+        return new Response("Native device-session handoff is disabled.", {
+          status: 403,
+          headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        });
+      }
       let expectedUserDoId: string | undefined;
       if (env.CF_ACCESS_AUD) {
         const payload = await verifyCfAccessJwt(req, env);
@@ -1018,7 +1033,7 @@ export default {
           return null;
         }
         return await ctx.exports.UserDurableObject.get(id).consumeDeviceSessionHandoff(state, ticket);
-      }, expectedUserDoId);
+      }, { enabled: true, expectedUserDoId });
     }
 
     if (url.pathname === "/api") {

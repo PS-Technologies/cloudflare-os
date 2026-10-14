@@ -71,8 +71,10 @@ export const submitDeviceSession = (state: string, start: DeviceSessionHandoffSt
 /** Ask the user before transferring an install session to the native Cloudflare OS app. */
 export const DeviceSessionHandoff = ({
   authenticatedApi,
+  enabled,
 }: {
   authenticatedApi: RpcStub<AuthenticatedApi>
+  enabled: boolean
 }) => {
   const attempt = deviceSessionAttempt(window.location.search)
   const [working, setWorking] = useState(false)
@@ -87,6 +89,7 @@ export const DeviceSessionHandoff = ({
   const identityFailed = identity?.api === authenticatedApi && identity.failed
 
   useEffect(() => {
+    if (!enabled) return
     let cancelled = false
     authenticatedApi.whoami().then(user => {
       if (!cancelled) setIdentity({ api: authenticatedApi, user, failed: user.type !== 'user' })
@@ -94,10 +97,10 @@ export const DeviceSessionHandoff = ({
       if (!cancelled) setIdentity({ api: authenticatedApi, user: null, failed: true })
     })
     return () => { cancelled = true }
-  }, [authenticatedApi])
+  }, [authenticatedApi, enabled])
 
   const continueInApp = async () => {
-    if (!attempt || !confirmedUser || working) return
+    if (!enabled || !attempt || !confirmedUser || working) return
     setWorking(true)
     setError(null)
     try {
@@ -111,6 +114,19 @@ export const DeviceSessionHandoff = ({
       setError(rpcFailureDescription(err) ?? 'Could not prepare this device session. Try again.')
       setWorking(false)
     }
+  }
+
+  if (!enabled) {
+    return (
+      <main className="flex min-h-full items-center justify-center bg-kumo-base p-6">
+        <div className="flex max-w-sm flex-col items-center gap-4 text-center">
+          <h1 className="text-lg font-semibold text-kumo-default">App sign-in is unavailable</h1>
+          <p role="alert" className="text-sm text-kumo-danger">
+            This installation has not enabled native device-session handoff.
+          </p>
+        </div>
+      </main>
+    )
   }
 
   if (!attempt) {
