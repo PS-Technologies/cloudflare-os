@@ -5,7 +5,7 @@
 // Runs against a real OverseerDurableObject (the TEST_OVERSEER binding, like
 // observer-verification-failure.test.ts); the owner's User DO is the only fake.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import type { OverseerDurableObject } from "../src/overseer.js";
@@ -74,6 +74,49 @@ describe("ensureOwnerActorAccounts", () => {
       await impl.ensureOwnerActorAccounts("owner", owner);
 
       expect(impl.storage.actorAccounts.get("owner").accountChoices).toEqual({ 1: 50, 2: 60 });
+    });
+  });
+
+  it("preserves choices written while account lookup is suspended", async () => {
+    let stub = env.TEST_OVERSEER.getByName("owner-actor-interleaved-choice");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = (instance as unknown as { impl: any }).impl;
+      impl.ownerProfileId = "owner";
+      seedGatekeepers(impl);
+      impl.storage.actorAccounts.put({ profileId: "owner", accountChoices: { 1: 99, 2: 50 } });
+      let owner = {
+        listAccountIdsForVendor: async () => {
+          impl.storage.actorAccounts.put({
+            profileId: "owner",
+            accountChoices: { 1: 77, 2: 50, 3: 42 },
+          });
+          return [50, 108];
+        },
+      } as any;
+
+      await impl.ensureOwnerActorAccounts("owner", owner);
+
+      expect(impl.storage.actorAccounts.get("owner").accountChoices).toEqual({
+        1: 77,
+        2: 50,
+        3: 42,
+      });
+    });
+  });
+
+  it("skips persistence when account choices are unchanged", async () => {
+    let stub = env.TEST_OVERSEER.getByName("owner-actor-unchanged-choice");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = (instance as unknown as { impl: any }).impl;
+      impl.ownerProfileId = "owner";
+      seedGatekeepers(impl);
+      impl.storage.actorAccounts.put({ profileId: "owner", accountChoices: { 1: 50, 2: 60 } });
+      let put = vi.spyOn(impl.storage.actorAccounts, "put");
+      let { owner } = ownerWithAccounts([50, 60]);
+
+      await impl.ensureOwnerActorAccounts("owner", owner);
+
+      expect(put).not.toHaveBeenCalled();
     });
   });
 
