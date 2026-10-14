@@ -9658,7 +9658,8 @@ class OverseerImpl implements AgentHooks {
     if (inScope.length === 0) return;
 
     let record = this.storage.actorAccounts.get(profileId);
-    let accountChoices: {[gatekeeperId: number]: number} = {...record?.accountChoices};
+    let initialChoices: {[gatekeeperId: number]: number} = {...record?.accountChoices};
+    let accountChoices: {[gatekeeperId: number]: number} = {...initialChoices};
 
     let idsByVendor = new Map<string, number[]>();
     for (let gk of inScope) {
@@ -9691,7 +9692,35 @@ class OverseerImpl implements AgentHooks {
       }
     }
 
-    this.storage.actorAccounts.put({profileId, accountChoices});
+    // Account and prompt RPCs above yield this object. Merge only decisions derived from the
+    // snapshot we read, and never overwrite a same-binding choice another invocation made while
+    // this one was suspended.
+    let latestRecord = this.storage.actorAccounts.get(profileId);
+    let latestChoices: {[gatekeeperId: number]: number} = {...latestRecord?.accountChoices};
+    let mergedChoices = {...latestChoices};
+    let candidateIds = new Set([...Object.keys(initialChoices), ...Object.keys(accountChoices)]);
+    for (let key of candidateIds) {
+      let id = Number(key);
+      let initialHas = Object.hasOwn(initialChoices, id);
+      let proposedHas = Object.hasOwn(accountChoices, id);
+      if (initialHas === proposedHas && initialChoices[id] === accountChoices[id]) continue;
+
+      let latestHas = Object.hasOwn(latestChoices, id);
+      if (latestHas !== initialHas || latestChoices[id] !== initialChoices[id]) continue;
+      if (proposedHas) {
+        mergedChoices[id] = accountChoices[id]!;
+      } else {
+        delete mergedChoices[id];
+      }
+    }
+
+    let latestKeys = Object.keys(latestChoices);
+    let mergedKeys = Object.keys(mergedChoices);
+    if (latestKeys.length === mergedKeys.length &&
+        latestKeys.every(key => latestChoices[Number(key)] === mergedChoices[Number(key)])) {
+      return;
+    }
+    this.storage.actorAccounts.put({profileId, accountChoices: mergedChoices});
   }
 
   async resolveActorForSession(
