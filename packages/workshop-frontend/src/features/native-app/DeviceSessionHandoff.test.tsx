@@ -36,6 +36,7 @@ describe('native device-session handoff', () => {
     begin: Begin,
     search = `?cfos_native_state=${state}&cfos_native_key=${publicKey}`,
     whoami: () => Promise<AiChatAuthorInfo> = async () => user,
+    enabled = true,
   ) => {
     window.history.replaceState({}, '', `/${search}`)
     container = document.createElement('div')
@@ -46,7 +47,7 @@ describe('native device-session handoff', () => {
       whoami,
     }) as unknown as RpcStub<AuthenticatedApi>
     await act(async () => {
-      root!.render(<DeviceSessionHandoff authenticatedApi={api} />)
+      root!.render(<DeviceSessionHandoff authenticatedApi={api} enabled={enabled} />)
     })
     return container
   }
@@ -77,6 +78,17 @@ describe('native device-session handoff', () => {
     expect(deviceSessionDestination('/signup', search))
       .toBe(`/signup?cfos_native_state=${state}&cfos_native_key=${publicKey}`)
     expect(deviceSessionDestination('/', '?cfos_native_state=short')).toBe('/')
+  })
+
+  it('does not inspect or transfer the browser session when handoff is disabled', async () => {
+    const begin = vi.fn<Begin>()
+    const whoami = vi.fn<() => Promise<AiChatAuthorInfo>>().mockResolvedValue(user)
+    const page = await render(begin, undefined, whoami, false)
+
+    expect(page.textContent).toContain('has not enabled native device-session handoff')
+    expect(whoami).not.toHaveBeenCalled()
+    expect(begin).not.toHaveBeenCalled()
+    expect(page.querySelector('button')).toBeNull()
   })
 
   it('requires confirmation before staging and submits the one-use ticket', async () => {

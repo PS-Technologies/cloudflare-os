@@ -23,6 +23,7 @@ import {
 } from '../features/native-app/DeviceSessionHandoff'
 import { NativeAppBridge } from '../features/native-app/NativeAppBridge'
 import { PageUpdateNotice } from '../features/stale-session/PageUpdateNotice'
+import { useServerConfig } from '../ServerConfigContext'
 
 export const Route = createRootRoute({
   component: RootComponent,
@@ -31,6 +32,7 @@ export const Route = createRootRoute({
 function RootComponent() {
   const rpcStub = useRpcStub()
   const connectionLost = useConnectionLost()
+  const serverConfig = useServerConfig()
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login } = useAuth(rpcStub)
   const pathname = useRouterState({ select: (s) => s.location.pathname })
   const workspace = useMatch({ from: '/workspace/$id', shouldThrow: false })
@@ -123,7 +125,12 @@ function RootComponent() {
   // The native handoff is a dedicated destination: never render the Workshop home page
   // behind it while the browser is returning credentials to the app.
   if (hasDeviceSessionParameters(window.location.search)) {
-    return <DeviceSessionHandoff authenticatedApi={authenticatedApi} />
+    return (
+      <DeviceSessionHandoff
+        authenticatedApi={authenticatedApi}
+        enabled={serverConfig?.deviceSessionHandoffEnabled === true}
+      />
+    )
   }
   return (
     <AuthProvider authenticatedApi={authenticatedApi} onLogout={logout}>
