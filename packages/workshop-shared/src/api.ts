@@ -1630,6 +1630,12 @@ export type ServerConfig = {
   cloudflareLimitsEnabled: boolean;
 
   /**
+   * Whether this deployment explicitly permits transferring an authenticated browser session to
+   * the native app. Defaults to false.
+   */
+  deviceSessionHandoffEnabled: boolean;
+
+  /**
    * Whether new account signups are allowed (admin-configurable, default true). The signup page
    * hides the create-account form when false.
    */

@@ -31,3 +31,11 @@ export function isPasswordAuthEnabled(env: Cloudflare.Env): boolean {
   if (env.DISABLE_PASSWORD_AUTH !== "true") return true;
   return !hasAuthGatekeepers(env);
 }
+
+/**
+ * Whether a browser may transfer its authenticated session to the native app. Disabled unless the
+ * deployment explicitly opts in because Access mode transfers the browser's full Access JWT.
+ */
+export function isDeviceSessionHandoffEnabled(env: Cloudflare.Env): boolean {
+  return env.ENABLE_DEVICE_SESSION_HANDOFF === "true";
+}
