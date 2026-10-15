@@ -77,20 +77,24 @@ describe("ensureOwnerActorAccounts", () => {
     });
   });
 
-  it("preserves choices written while account lookup is suspended", async () => {
+  it("merges repairs without overwriting choices written while account lookup is suspended",
+      async () => {
     let stub = env.TEST_OVERSEER.getByName("owner-actor-interleaved-choice");
     await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
       let impl = (instance as unknown as { impl: any }).impl;
       impl.ownerProfileId = "owner";
-      seedGatekeepers(impl);
-      impl.storage.actorAccounts.put({ profileId: "owner", accountChoices: { 1: 99, 2: 50 } });
+      seedGatekeepers(impl, [1, 2, 4]);
+      impl.storage.actorAccounts.put({
+        profileId: "owner",
+        accountChoices: { 1: 99, 2: 50, 4: 88 },
+      });
       let owner = {
         listAccountIdsForVendor: async () => {
           impl.storage.actorAccounts.put({
             profileId: "owner",
-            accountChoices: { 1: 77, 2: 50, 3: 42 },
+            accountChoices: { 1: 77, 2: 50, 3: 42, 4: 88 },
           });
-          return [50, 108];
+          return [50];
         },
       } as any;
 
@@ -100,6 +104,7 @@ describe("ensureOwnerActorAccounts", () => {
         1: 77,
         2: 50,
         3: 42,
+        4: 50,
       });
     });
   });
