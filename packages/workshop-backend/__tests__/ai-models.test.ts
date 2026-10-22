@@ -43,6 +43,13 @@ const WORKERS_AI_CONFIG: AiModelConfig = {
   apiToken: "ignored-in-gateway-mode",
 };
 
+// An AI Gateway dynamic route an admin added under the Workers AI provider.
+const DYNAMIC_ROUTE_CONFIG: AiModelConfig = {
+  provider: "cloudflare",
+  model: "dynamic/Standard",
+  apiToken: "ignored-in-gateway-mode",
+};
+
 function env(overrides: Partial<Cloudflare.Env> = {}): Cloudflare.Env {
   return {
     CF_AI_GATEWAY: "platform-gateway",
@@ -249,6 +256,31 @@ describe("getModel AI Gateway routing", () => {
     expect(request.headers.get("x-session-affinity")).toBe("session-a");
   }, 15000);
 
+  it("sends a dynamic route to the gateway's /compat endpoint, where the route lives", async () => {
+    // The workers-ai route looks a route up on the account's default gateway; /compat looks it
+    // up on the gateway in its URL. A catalog model keeps Workers AI's own route.
+    const handle = getModel(env(), DYNAMIC_ROUTE_CONFIG, INITIATOR);
+    expect(getModel(env(), WORKERS_AI_CONFIG, INITIATOR).model.baseUrl).toBe(
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/workers-ai/v1");
+
+    expect(handle.model.api).toBe("openai-completions");
+    expect(handle.model.baseUrl).toBe(
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/compat");
+    expect(handle.aiGatewayLogRoute).toEqual({
+      gateway: "platform-gateway",
+      accountId: "gateway-account-id",
+      apiToken: "gateway-token",
+    });
+
+    const request = await captureRequest(handle);
+    expect(request.url).toBe(
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/compat/" +
+        "chat/completions");
+    expect((JSON.parse(request.body) as { model: string }).model).toBe("dynamic/Standard");
+    expect(request.headers.get("cf-aig-authorization")).toBe("Bearer gateway-token");
+    expect(request.headers.get("authorization")).toBeNull();
+  }, 15000);
+
   // The environment's providers are not all a deployment enables, so the refusal lists none.
   it("refuses a provider the gateway has no route for", () => {
     expect(() => getModel(env({ CF_AI_GATEWAY_PROVIDERS: "anthropic,ollama" }),
@@ -363,6 +395,23 @@ describe("getModel AI Gateway binding transport", () => {
     // openai-completions adapters inject `Authorization: Bearer unused` under header-owned
     // auth; the gatewayAuthHeaders nulls must delete it before dispatch, else the gateway
     // would treat it as a request-supplied provider key overriding stored keys.
+    const headerNames = Object.keys(entry.headers).map((name) => name.toLowerCase());
+    expect(headerNames).not.toContain("authorization");
+    expect(headerNames).not.toContain("x-api-key");
+  }, 15000);
+
+  it("drives a dynamic route through the binding to the gateway's /compat endpoint", async () => {
+    const handle = getModel(bindingEnv(), DYNAMIC_ROUTE_CONFIG, INITIATOR);
+
+    expect(handle.model.baseUrl).toBe(
+        "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/compat");
+    expect(handle.aiGatewayLogRoute).toEqual({ gateway: "platform-gateway" });
+
+    const entry = await captureEntry(handle);
+    expect(entry.url).toBe(
+        "https://workers-binding.ai/ai-gateway/gateways/platform-gateway/compat/chat/completions");
+    expect((JSON.parse(entry.body) as { model: string }).model).toBe("dynamic/Standard");
+    expect(entry.headers["cf-aig-authorization"]).toBe("Bearer cloudflare-gateway-binding");
     const headerNames = Object.keys(entry.headers).map((name) => name.toLowerCase());
     expect(headerNames).not.toContain("authorization");
     expect(headerNames).not.toContain("x-api-key");
