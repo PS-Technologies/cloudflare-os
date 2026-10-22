@@ -307,11 +307,11 @@ function workersAiCompat(catalog: CatalogEntry | undefined): OpenAICompletionsCo
 // over the AI binding (https://workers-binding.ai/ai-gateway/gateways/{gateway}); each
 // provider's native API is exposed under the same per-provider path on either. AI Gateway also
 // offers a unified OpenAI-compat translation layer (/compat), which only the Auto Router model
-// speaks, because the router exists nowhere else: for every other model we speak the provider's
-// native API, since the translation drops provider features pi relies on (extended thinking,
-// Anthropic cache_control prompt caching, the OpenAI Responses API). Billing -- including unified
-// billing on a user's own gateway -- is orthogonal to which API a request speaks. Returns
-// undefined for providers AI Gateway cannot serve (ollama).
+// and a Workers AI dynamic route (below) speak, because each exists only on the gateway: for every
+// other model we speak the provider's native API, since the translation drops provider features pi
+// relies on (extended thinking, Anthropic cache_control prompt caching, the OpenAI Responses API).
+// Billing -- including unified billing on a user's own gateway -- is orthogonal to which API a
+// request speaks. Returns undefined for providers AI Gateway cannot serve (ollama).
 function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Api> | undefined {
   const catalog = gatewayCatalogModel(config);
   const window = modelTokenWindow(config, catalog);
@@ -369,12 +369,16 @@ function gatewayNativeModel(config: AiModelConfig, gatewayUrl: string): Model<Ap
       // Workers AI's own OpenAI-compatible endpoint, exposed through the gateway's workers-ai
       // route. This is Workers AI's native chat API (the same surface as its direct
       // /accounts/{id}/ai/v1 REST endpoint), not the gateway's cross-provider /compat layer.
+      // The exception is a dynamic route (dynamic/<route>), which belongs to one gateway: the
+      // workers-ai route looks it up on the account's default gateway, so a route made on any
+      // other is not found there. /compat looks it up on the gateway in its own URL.
       return {
         id: config.model,
         name: catalog?.name ?? config.model,
         api: "openai-completions",
         provider: "cloudflare-workers-ai",
-        baseUrl: `${gatewayUrl}/workers-ai/v1`,
+        baseUrl: config.model.startsWith("dynamic/")
+            ? `${gatewayUrl}/compat` : `${gatewayUrl}/workers-ai/v1`,
         reasoning: catalog?.reasoning ?? false,
         input: catalog?.input ?? ["text"],
         cost: catalog?.cost ?? ZERO_COST,
