@@ -105,8 +105,11 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-async function renderModal(props: { initialVendorId?: string, initialResourceUrlPattern?: string } = {}) {
-  testState.authenticatedApi = authenticatedApi()
+async function renderModal(
+  props: { initialVendorId?: string, initialResourceUrlPattern?: string } = {},
+  api = authenticatedApi(),
+) {
+  testState.authenticatedApi = api
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
@@ -160,5 +163,76 @@ describe('GatekeeperModal model pickers', () => {
       const heading = option.closest('[role="group"]')?.getAttribute('aria-labelledby')
       return heading ? `${document.getElementById(heading)!.textContent}: ${option.textContent}` : option.textContent
     })).toEqual(options)
+  })
+})
+
+function buttonLabels() {
+  return Array.from(document.body.querySelectorAll('button'), button => button.textContent ?? '')
+}
+
+describe('GatekeeperModal ambient vendors', () => {
+  const FILES_RESOURCE = {
+    urlPattern: 'https://files.example.com/drop/*',
+    title: 'Work files',
+    description: 'Files shared with this workspace',
+  }
+  const filesVendor = { displayName: 'Files', url: 'https://files.example.com/', autoProvisionsAccount: true }
+
+  // A Files-like vendor set to "enabled": its one account is auto-provisioned, and it has no
+  // connect flow, so connectAccount() would throw.
+  function ambientApi(options: { hasAccount: boolean }) {
+    const subscribeConnectedAccounts = vi.fn<(subscriber: ConnectedAccountsSubscriber, filter?: unknown) => ReturnType<typeof subscription>>(subscriber => {
+      if (options.hasAccount) {
+        subscriber.add(7, { displayName: 'Files', avatar: { url: 'https://files.example.com/avatar' } }, filesVendor, [FILES_RESOURCE], true, 'files')
+      }
+      subscriber.ready()
+      return subscription()
+    })
+    const provisionAmbientAccount = vi.fn<(vendorId: string) => Promise<void>>(async () => {})
+    const connectAccount = vi.fn<() => Promise<never>>(async () => { throw new Error('auto-provisioned; no connect flow') })
+    const api = {
+      ...authenticatedApi(),
+      listGatekeeperVendors: async () => [{
+        id: 'files',
+        description: filesVendor,
+        supportedResources: [FILES_RESOURCE],
+      }],
+      subscribeConnectedAccounts,
+      provisionAmbientAccount,
+      connectAccount,
+    } as unknown as RpcStub<AuthenticatedApi>
+    return { api, subscribeConnectedAccounts, provisionAmbientAccount, connectAccount }
+  }
+
+  it('shows the forced account and offers no second one', async () => {
+    vi.stubGlobal('ResizeObserver', class {
+      observe() {}
+      disconnect() {}
+    })
+    const { api, subscribeConnectedAccounts } = ambientApi({ hasAccount: true })
+    await renderModal({ initialVendorId: 'files', initialResourceUrlPattern: FILES_RESOURCE.urlPattern }, api)
+
+    expect(subscribeConnectedAccounts.mock.calls[0][1]).toEqual({ includeForcedAutoProvisionedAccounts: true })
+    await vi.waitFor(() => {
+      expect(document.body.querySelector('[data-testid="resource-configurator"]')).not.toBeNull()
+    })
+    expect(buttonLabels().some(label => label.includes('Use another Files account'))).toBe(false)
+    expect(buttonLabels().some(label => label.includes('Connect Files'))).toBe(false)
+  })
+
+  it('provisions the account instead of starting a sign-in', async () => {
+    vi.stubGlobal('ResizeObserver', class {
+      observe() {}
+      disconnect() {}
+    })
+    const { api, provisionAmbientAccount, connectAccount } = ambientApi({ hasAccount: false })
+    await renderModal({ initialVendorId: 'files', initialResourceUrlPattern: FILES_RESOURCE.urlPattern }, api)
+
+    const connect = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Connect Files'))!
+    await act(async () => connect.click())
+
+    expect(provisionAmbientAccount).toHaveBeenCalledWith('files')
+    expect(connectAccount).not.toHaveBeenCalled()
   })
 })

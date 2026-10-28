@@ -38,6 +38,7 @@ export function AccountChooser({
   resourceTitle,
   connecting,
   reconnectingAccountId,
+  singleAccount = false,
   requiredResourceUrlPatterns,
   grantingAccountId = null,
   onSelect,
@@ -52,6 +53,8 @@ export function AccountChooser({
   resourceTitle?: string
   connecting: boolean
   reconnectingAccountId: number | null
+  /** The vendor holds at most one account per user (ambient), so there is no "another" to add. */
+  singleAccount?: boolean
   requiredResourceUrlPatterns?: string[]
   grantingAccountId?: number | null
   onSelect: (id: number) => void
@@ -139,7 +142,7 @@ export function AccountChooser({
           )
         })}
 
-        {(!isEmailMailbox || accounts.length === 0) && (
+        {((!isEmailMailbox && !singleAccount) || accounts.length === 0) && (
           <button
             type="button"
             onClick={onConnect}

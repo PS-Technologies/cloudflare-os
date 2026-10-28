@@ -142,7 +142,10 @@ export default function ResourcePicker({
         setAccountsLoaded(true)
       },
     })
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
+    // Include forced ("enabled") ambient accounts: a pasted link to one of their resources needs the
+    // account, and their vendor has no connect flow to offer instead.
+    const subscription = authenticatedApi.subscribeConnectedAccounts(
+      subscriber, { includeForcedAutoProvisionedAccounts: true })
     subscription.catch(error => {
       if (cancelled) return
       logRpcFailure('Failed to subscribe to connected accounts:', error)
@@ -325,8 +328,9 @@ export default function ResourcePicker({
         })
       }
 
-      // "Connect new account" row (not shown in accountsOnly mode).
-      if (!accountsOnly) {
+      // "Connect new account" row (not shown in accountsOnly mode, nor once an ambient vendor's one
+      // account exists).
+      if (!accountsOnly && !(vendor.description.autoProvisionsAccount && vendorAccounts.length > 0)) {
         items.push({
           type: 'connect',
           vendorId: vendor.id,
@@ -399,7 +403,12 @@ export default function ResourcePicker({
   const handleConnectNew = async (vendorId: string, resourceUrlPatterns?: string[]) => {
     setConnectingVendor(vendorId)
     try {
-      openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns))
+      if (allVendors.find(vendor => vendor.id === vendorId)?.description.autoProvisionsAccount) {
+        // No connect flow; the minted account arrives through the accounts subscription.
+        await authenticatedApi.provisionAmbientAccount(vendorId)
+      } else {
+        openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns))
+      }
     } catch (error) {
       console.error('Failed to initiate connection:', error)
       toasts.add({ title: 'Failed to start connection flow', variant: 'error' })
@@ -604,7 +613,7 @@ export default function ResourcePicker({
 
                 {/* Connect new account */}
                 {(() => {
-                  if (accountsOnly) return null
+                  if (accountsOnly || (vendor.description.autoProvisionsAccount && vendorAccounts.length > 0)) return null
                   const isActive = itemIdx === activeIndex
                   itemIdx++
                   return (
