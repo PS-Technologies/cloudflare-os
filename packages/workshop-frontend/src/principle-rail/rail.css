@@ -1,0 +1,80 @@
+/* The rail every Principle app wears. Plain CSS on brand roles, so it needs no app's Tailwind, utilities or motion
+   tokens: the easing is written out, and every class starts ps-rail- because home, the studios and Dispatch each
+   already own a .press, .tile and .av. Copied byte for byte into Agent Dispatch. Hover only where there is a real
+   pointer. */
+
+.ps-rail {
+  position: relative;
+  display: flex;
+  width: 68px;
+  flex: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 12px 0;
+  background: var(--sidebar);
+  font-family: var(--font-ui, inherit);
+}
+/* Above the app's own sidebar, so a peek slides out from behind it. */
+.ps-rail[data-variant='column'] { z-index: 50; }
+.ps-rail[data-variant='drawer'] { height: 100%; }
+
+.ps-rail a, .ps-rail button { -webkit-tap-highlight-color: transparent; }
+.ps-rail a { text-decoration: none; }
+
+/* A small shrink so a click feels physical. */
+.ps-rail-press { transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1), background-color 120ms ease, color 120ms ease; }
+.ps-rail-press:active { transform: scale(0.97); }
+
+.ps-rail-badge { display: flex; width: 40px; height: 40px; margin-bottom: 12px; align-items: center; justify-content: center; border-radius: 10px; }
+.ps-rail-badge img { display: block; width: auto; height: 24px; }
+.ps-rail-badge .ps-rail-badge-dark, [data-mode='dark'] .ps-rail-badge .ps-rail-badge-light { display: none; }
+[data-mode='dark'] .ps-rail-badge .ps-rail-badge-dark { display: block; }
+
+/* 11px is below the type scale on purpose: a 58px column has to fit "Contracts". */
+.ps-rail-item { display: flex; width: 58px; flex-direction: column; align-items: center; gap: 3px; padding: 5px 0; border-radius: 10px; color: var(--ink-3); font-size: 11px; font-weight: 500; line-height: 1.2; }
+.ps-rail-icon { display: flex; width: 38px; height: 30px; align-items: center; justify-content: center; border-radius: 9px; transition: background-color 120ms cubic-bezier(0.23, 1, 0.32, 1); }
+.ps-rail-item[aria-current='page'] { color: var(--ink); }
+.ps-rail-item[aria-current='page'] .ps-rail-icon { background: var(--card-3); }
+
+.ps-rail-tile { display: inline-flex; width: 26px; height: 26px; align-items: center; justify-content: center; border-radius: 7px; }
+.ps-rail-tile[data-tone='accent'] { background: var(--accent-soft); color: var(--accent-ink); }
+.ps-rail-tile[data-tone='ok'] { background: var(--ok-soft); color: var(--ok-ink); }
+
+.ps-rail-rule { width: 28px; height: 1px; margin: 8px 0; background: var(--line-2); }
+.ps-rail-fill { flex: 1; }
+
+.ps-rail-switch { position: relative; display: inline-flex; width: 30px; height: 30px; margin-bottom: 6px; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--ink-3); cursor: pointer; }
+/* Where it goes, said beside it once you rest on it. Only the opacity moves. */
+.ps-rail-switch::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: 50%;
+  left: calc(100% + 10px);
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity 125ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+.ps-rail-switch:focus-visible::after { opacity: 1; }
+
+.ps-rail-avatar { display: inline-flex; width: 32px; height: 32px; flex: none; margin-top: 6px; align-items: center; justify-content: center; border-radius: 50%; background: var(--card-3); color: var(--ink); font-size: 11px; font-weight: 600; line-height: 1; }
+
+@media (hover: hover) and (pointer: fine) {
+  .ps-rail-item:hover { color: var(--ink); }
+  .ps-rail-item:hover .ps-rail-icon, .ps-rail-switch:hover { background: var(--card-2); }
+  .ps-rail-switch:hover { color: var(--ink); }
+  .ps-rail-switch:hover::after { opacity: 1; transition-delay: 300ms; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ps-rail-press:active { transform: none; }
+}
