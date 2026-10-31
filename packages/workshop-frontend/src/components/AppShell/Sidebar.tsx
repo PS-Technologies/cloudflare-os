@@ -1,27 +1,22 @@
-import { Link } from '@tanstack/react-router'
 import {
   ArrowLeft,
   Blueprint,
   BookOpen,
   Compass,
-  Hexagon,
   House,
-  MagnifyingGlass,
   SidebarSimple,
   SquaresFour,
   Stack,
 } from '@phosphor-icons/react'
 import { useSiteName } from '../../ServerConfigContext'
-import SiteLogo from '../SiteLogo'
 import { useGatekeeperApps } from '../../useGatekeeperApps'
-import { openCommandPalette } from './commandPaletteBus'
 import SidebarItem from './SidebarItem'
+import PrincipleSidebarTitle from './PrincipleSidebarTitle'
 import {
   SidebarWorkspacesProvider,
   SidebarWorkspacesTools,
   SidebarWorkspacesLists,
 } from './SidebarWorkspaces'
-import SidebarUtilityStrip from './SidebarUtilityStrip'
 import { inNativeApp, returnToInstalls } from '../../features/native-app/nativeApp'
 
 /**
@@ -38,9 +33,11 @@ import { inNativeApp, returnToInstalls } from '../../features/native-app/nativeA
  */
 export default function Sidebar({
   collapsed,
+  mobile = false,
   onToggleCollapsed,
 }: {
   collapsed: boolean
+  mobile?: boolean
   onToggleCollapsed: () => void
 }) {
   const siteName = useSiteName()
@@ -53,53 +50,12 @@ export default function Sidebar({
     <aside
       aria-label="Primary"
       className={[
-        // Sidebar is the app chrome: a hair greyer than the (lighter) content canvas so the two
-        // surfaces read as distinct without a heavy divider.
-        'flex h-full flex-col border-r border-kumo-line bg-kumo-elevated',
-        collapsed ? 'w-[56px]' : 'w-[min(320px,100vw)] md:w-[260px]',
-        'shrink-0 transition-[width] duration-200 ease-out',
+        'flex h-full flex-col bg-[var(--sidebar)] px-2.5 pt-2.5 pb-3',
+        collapsed ? 'w-[56px]' : 'w-[calc(min(320px,100vw)_-_68px)] md:w-[248px]',
+        'shrink-0 transition-[width] duration-200 ease-out md:bg-transparent',
       ].join(' ')}
     >
-      {/* Brand row */}
-      <div
-        className={[
-          'flex h-14 shrink-0 items-center border-b border-kumo-line',
-          collapsed ? 'justify-center px-1.5' : 'justify-between gap-2 px-3',
-        ].join(' ')}
-      >
-        <Link to="/" aria-label={siteName} className="flex min-w-0 items-center gap-2">
-          <SiteLogo size={20} className="shrink-0">
-            <Hexagon size={20} weight="bold" className="text-kumo-brand shrink-0" />
-          </SiteLogo>
-          {!collapsed && (
-            <span className="truncate text-[14px] leading-5 font-semibold tracking-[-0.25px] text-kumo-default">
-              {siteName}
-            </span>
-          )}
-        </Link>
-        {!collapsed && (
-          <div className="flex items-center gap-0.5">
-            <button
-              type="button"
-              onClick={() => openCommandPalette()}
-              aria-label="Search"
-              title="Search (⌘K)"
-              className="press flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-kumo-inactive transition-colors hover:bg-kumo-tint hover:text-kumo-default"
-            >
-              <MagnifyingGlass size={15} />
-            </button>
-            <button
-              type="button"
-              onClick={onToggleCollapsed}
-              aria-label="Collapse sidebar"
-              title="Collapse sidebar"
-              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-kumo-inactive transition-colors hover:bg-kumo-tint hover:text-kumo-default"
-            >
-              <SidebarSimple size={15} />
-            </button>
-          </div>
-        )}
-      </div>
+      <PrincipleSidebarTitle siteName={siteName} collapsed={collapsed} mobile={mobile} onToggleCollapsed={onToggleCollapsed} />
 
       {/* Expand affordance when collapsed — placed just under the logo for discoverability. */}
       {collapsed && (
@@ -201,7 +157,6 @@ export default function Sidebar({
         </div>
       </SidebarWorkspacesProvider>
 
-      <SidebarUtilityStrip collapsed={collapsed} />
       {inNativeApp() && (
         <button
           type="button"

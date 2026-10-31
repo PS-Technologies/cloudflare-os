@@ -11,6 +11,7 @@ import { HANDOFF_PATH } from '../connectHandoff'
 import { FeatureFlagsProvider } from '../FeatureFlagsContext'
 import Header from '../components/Header'
 import AppShell from '../components/AppShell/AppShell'
+import PrincipleWorkspace from '../components/AppShell/PrincipleWorkspace'
 import LoginPage from '../LoginPage'
 import OnboardingWizard from '../OnboardingWizard'
 import AccountSelectionModal from '../components/billing/AccountSelectionModal'
@@ -199,9 +200,9 @@ function AuthenticatedShell({
     <>
       <AccountSelectionModal />
       {fullscreen ? (
-        <main className="h-full min-h-0">
+        <PrincipleWorkspace>
           <Outlet />
-        </main>
+        </PrincipleWorkspace>
       ) : (
         <AppShell>
           <Outlet />

@@ -370,9 +370,11 @@ const isBrowser = typeof window !== 'undefined'
 // the one `max-md:` compiles to, so the two agree at fractional widths and at any root font size.
 const isSinglePaneLayout = () => window.matchMedia?.('(width < 48rem)').matches ?? false
 
-function clampChatWidth(width: number) {
+// Principle: the frame sets the editor in a card right of the rail, so `available` is the editor's
+// own width where it is known; the window's is the fallback.
+function clampChatWidth(width: number, available = isBrowser ? window.innerWidth : 0) {
   if (!isBrowser) return Math.max(MIN_CHAT_WIDTH, Math.min(DEFAULT_CHAT_WIDTH, width))
-  const max = Math.max(MIN_CHAT_WIDTH, window.innerWidth - MIN_WORKSPACE_WIDTH)
+  const max = Math.max(MIN_CHAT_WIDTH, available - MIN_WORKSPACE_WIDTH)
   return Math.max(MIN_CHAT_WIDTH, Math.min(max, width))
 }
 
@@ -538,6 +540,14 @@ export default function GadgetEditor() {
   // ── layout ───────────────────────────────────────────────────────────────────
   const [chatWidth, setChatWidth] = useState(getInitialChatWidth)
   const chatWidthRef = useRef(chatWidth)
+  // Principle: the editor's box, which the chat width is measured against. A width saved in a wider
+  // window is fitted to it as soon as it opens.
+  const bodyRef = useRef<HTMLDivElement | null>(null)
+  const attachBody = useCallback((body: HTMLDivElement | null) => {
+    bodyRef.current = body
+    const available = body?.getBoundingClientRect().width
+    if (available) setChatWidth(width => clampChatWidth(width, available))
+  }, [])
   const [isResizing, setIsResizing] = useState(false)
   const [chosenTab, setActiveTab] = useState<RightTab>('app')
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView | null>(() =>
@@ -1120,7 +1130,7 @@ export default function GadgetEditor() {
 
   useEffect(() => {
     const handleResize = () => {
-      setChatWidth(width => clampChatWidth(width))
+      setChatWidth(width => clampChatWidth(width, bodyRef.current?.getBoundingClientRect().width))
     }
     window.addEventListener('resize', handleResize)
     return () => window.removeEventListener('resize', handleResize)
@@ -1314,12 +1324,16 @@ export default function GadgetEditor() {
     },
     [showFullEditor],
   )
+  const chatWidthAt = useCallback((clientX: number) => {
+    const editor = bodyRef.current!.getBoundingClientRect()
+    return clampChatWidth(clientX - editor.left, editor.width)
+  }, [])
   const handleResizePointerMove = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
       if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
-      setChatWidth(clampChatWidth(e.clientX))
+      setChatWidth(chatWidthAt(e.clientX))
     },
-    [],
+    [chatWidthAt],
   )
   const handleResizePointerUp = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -1328,12 +1342,12 @@ export default function GadgetEditor() {
       }
       const width = e.type === 'pointercancel'
         ? chatWidthRef.current
-        : clampChatWidth(e.clientX)
+        : chatWidthAt(e.clientX)
       setChatWidth(width)
       persistChatWidth(width)
       setIsResizing(false)
     },
-    [persistChatWidth],
+    [chatWidthAt, persistChatWidth],
   )
 
   useEffect(() => {
@@ -1959,7 +1973,7 @@ export default function GadgetEditor() {
       </div>
 
       {/* ═══ BODY ═════════════════════════════════════════════════════════════ */}
-      <div className="flex flex-1 min-h-0 relative overflow-hidden">
+      <div ref={attachBody} className="flex flex-1 min-h-0 relative overflow-hidden">
 
         {isAgentActive && (
           <div

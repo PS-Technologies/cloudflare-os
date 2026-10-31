@@ -1,37 +1,28 @@
 import { useNavigate } from '@tanstack/react-router'
-import { DropdownMenu } from '@cloudflare/kumo'
+import { DropdownMenu, Tooltip } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from '../AuthContext'
-import { useAvatar } from '../useAvatar'
+import { GearSix } from '@phosphor-icons/react'
+import { PANEL_BUTTON } from './AppShell/PanelToggle'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from './menuStyles'
 
 export default function UserMenu() {
-  const { authenticatedApi, logout, currentUser, isAdmin } = useAuthenticatedApi()
+  const { logout, isAdmin } = useAuthenticatedApi()
   const navigate = useNavigate()
-
-  const avatarUrl = useAvatar(authenticatedApi, currentUser?.id)
-
-  const initials = currentUser?.name
-    ? currentUser.name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase()
-    : 'U'
 
   return (
     <DropdownMenu>
-      <DropdownMenu.Trigger
-        render={
-          <button
-            className="flex h-11 w-11 cursor-pointer items-center justify-center overflow-hidden rounded-full bg-kumo-tint transition-colors hover:bg-kumo-fill md:h-7 md:w-7"
-            title="Open profile menu"
-            aria-label="Open profile menu"
-          >
-            {avatarUrl ? (
-              <img src={avatarUrl} alt="" className="w-full h-full object-cover" />
-            ) : (
-              <span className="text-xs font-medium text-kumo-strong">{initials}</span>
-            )}
-          </button>
-        }
-      />
+      <Tooltip content="Settings" side="bottom" render={<span className="inline-flex" />}>
+        <DropdownMenu.Trigger
+          render={<button type="button" className={PANEL_BUTTON} aria-label="Settings"><GearSix size={16} /></button>}
+        />
+      </Tooltip>
       <DropdownMenu.Content className={MENU_CONTENT} style={MENU_POSITIONER_STYLE}>
+        <DropdownMenu.Item
+          onClick={() => navigate({ to: '/gatekeepers' })}
+          className={MENU_ITEM}
+        >
+          Gatekeepers
+        </DropdownMenu.Item>
         <DropdownMenu.Item
           onClick={() => navigate({ to: '/profile' })}
           className={MENU_ITEM}

@@ -13,6 +13,10 @@
     <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
     <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png" />
     <title>Cloudflare OS</title>
+    <!-- Principle: the theme from the ps-theme cookie, set before the first paint. @ps/ui's
+         THEME_BOOT, the same on every Principle app; scripts/principle-theme.test.mjs in Agent
+         Dispatch keeps it so. -->
+    <script>(function(){try{var m=/(?:^|;\s*)ps-theme=(light|dark|charcoal)(?:;|$)/.exec(document.cookie),t=m?m[1]:matchMedia('(prefers-color-scheme: dark)').matches?'charcoal':'light',r=document.documentElement;r.dataset.theme=t;r.dataset.mode=t==='light'?'light':'dark'}catch(e){}})()</script>
   </head>
   <body>
     <div id="root"></div>

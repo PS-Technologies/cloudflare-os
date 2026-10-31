@@ -21,7 +21,7 @@ import {
   persistSelectedModel,
 } from "../modelSelection";
 import { useDocumentTitle } from "../useDocumentTitle";
-import { homePromptFromSearch } from "../homePrompt";
+import { homeHandOff, homePromptFromSearch } from "../homePrompt";
 import { composerDraftStorageKey } from "../features/chat/composer/draft/composerDraft";
 
 type HomeSearch = {
@@ -59,12 +59,21 @@ export function HomePageContent({ prompt }: HomeSearch) {
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
   // Bumped each time a task suggestion is picked; the composer re-seeds its text off the nonce.
   const [seed, setSeed] = useState<{ text: string; nonce: number } | null>(null);
+  // Principle: a question the home page's Ask Watts handed over is sent, not typed (see below).
+  const [handOff] = useState(() => homeHandOff(prompt));
+  const handedOff = useRef(false);
+  // Closes the composer while that question is on its way, so nothing else is sent or typed over it.
+  const [handingOff, setHandingOff] = useState(handOff !== undefined);
+  // Undefined until the models load, then whether they did.
+  const [modelsLoaded, setModelsLoaded] = useState<boolean>();
 
   useEffect(() => {
     if (!prompt) return;
-    setSeed((previous) => ({ text: prompt, nonce: (previous?.nonce ?? 0) + 1 }));
+    if (prompt !== handOff) {
+      setSeed((previous) => ({ text: prompt, nonce: (previous?.nonce ?? 0) + 1 }));
+    }
     navigate({ to: "/", search: {}, replace: true });
-  }, [navigate, prompt]);
+  }, [handOff, navigate, prompt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -73,9 +82,11 @@ export function HomePageContent({ prompt }: HomeSearch) {
         if (cancelled) return;
         setModels(list);
         setSelectedModel(getStoredSelectedModel(list));
+        setModelsLoaded(true);
       })
       .catch((err) => {
         logRpcFailure("Failed to fetch models:", err);
+        if (!cancelled) setModelsLoaded(false);
         // Toast unless it's a connection error (reconnect refetches); a do-reset here already
         // survived the Worker's same-colo retry, so the user should hear about it.
         if (classifyRpcError(err) !== "connection") {
@@ -151,6 +162,20 @@ export function HomePageContent({ prompt }: HomeSearch) {
     [ensureProvisionalGadget, navigate, toasts],
   );
 
+  // Home's question goes with the person's saved model, as a press of Send would send it. If the
+  // models or the send fail, it waits in the composer for them to send it themselves, unless a task
+  // suggestion they picked meanwhile is already there.
+  useEffect(() => {
+    if (!handOff || modelsLoaded === undefined || handedOff.current) return;
+    handedOff.current = true;
+    const wait = () => {
+      setHandingOff(false);
+      setSeed((previous) => previous ?? { text: handOff, nonce: 1 });
+    };
+    if (modelsLoaded) handleSend(handOff, selectedModel).catch(wait);
+    else wait();
+  }, [handOff, handleSend, modelsLoaded, selectedModel]);
+
   const getOverseer = useCallback((): RpcStub<Overseer> => {
     ensureProvisionalGadget();
     return provisionalOverseerRef.current!.stub;
@@ -209,6 +234,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
           minRows={3}
           seedText={seed?.text}
           seedNonce={seed?.nonce}
+          blockedReason={handingOff ? "Sending your question from home…" : undefined}
           draftStorageKey={currentUser
             ? composerDraftStorageKey(currentUser.id, "home")
             : undefined}

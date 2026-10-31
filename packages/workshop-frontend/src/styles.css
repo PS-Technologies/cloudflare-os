@@ -1,6 +1,12 @@
+@import "./principle/fonts.css";
 @source "../node_modules/@cloudflare/kumo/dist/**/*.{js,jsx,ts,tsx}";
 @import "@cloudflare/kumo/styles";
 @import "tailwindcss";
+/* Principle: @ps/brand's roles for its three themes, and Kumo's tokens on them (theme.ts). */
+@import "./principle/tokens.css";
+@import "./principle/kumo.css";
+/* Principle: the rail every Principle app wears, drawn on those roles (PrincipleRail.tsx). */
+@import "./principle-rail/rail.css";
 @custom-variant dark (&:where([data-mode="dark"], [data-mode="dark"] *));
 
 @theme {
@@ -216,6 +222,31 @@
 
   --shadow-stack: 1px 6px 6px 0 #ffffff08 inset, 0 0 0 1px #ffffff05 inset,
     0 18px 40px 0 #00000033, 0 4px 12px 0 #0000002e;
+}
+
+/* Principle: this file's own tokens on the brand's roles. Unlayered and more specific than the
+   palettes above, so it wins in every theme; an admin accent, set inline, still wins over it. */
+html:root[data-theme] {
+  --font-sans: var(--font-ui);
+  --color-kumo-ring: var(--accent);
+  --color-kumo-bubble-user: var(--accent-soft);
+  --color-kumo-info: var(--accent);
+  --color-kumo-info-tint: var(--accent-soft);
+  --color-kumo-success: var(--ok);
+  --color-kumo-success-tint: var(--ok-soft);
+  --color-kumo-warning: var(--warn);
+  --color-kumo-warning-tint: var(--warn-soft);
+  --color-kumo-danger: var(--bad);
+  --color-kumo-danger-tint: var(--bad-soft);
+  --text-color-kumo-default-hover: var(--ink);
+  --text-color-kumo-success: var(--ok-ink);
+  --text-color-kumo-warning: var(--warn-ink);
+  --text-color-kumo-danger: var(--bad-ink);
+  --color-accent-100: var(--accent);
+  --color-accent-200: var(--accent-ink);
+  --color-selection-bg: var(--accent-soft);
+  --color-selection-text: var(--accent-ink);
+  --shadow-stack: var(--shadow-2);
 }
 
 :root {
