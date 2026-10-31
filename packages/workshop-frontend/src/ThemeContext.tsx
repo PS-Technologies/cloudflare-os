@@ -43,6 +43,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     return () => mediaQuery.removeEventListener('change', handleChange)
   }, [themeMode])
 
+  // Principle: Back can restore this page from the browser's memory after another Principle app
+  // changed the shared `ps-theme` choice. Reread it then, without saving it back.
+  useEffect(() => {
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (!event.persisted) return
+      const mode = readThemeMode()
+      setThemeState({ themeMode: mode, resolvedThemeMode: applyThemeMode(mode) })
+    }
+    window.addEventListener('pageshow', handlePageShow)
+    return () => window.removeEventListener('pageshow', handlePageShow)
+  }, [])
+
   const value = useMemo<ThemeContextValue>(() => ({
     themeMode,
     resolvedThemeMode,

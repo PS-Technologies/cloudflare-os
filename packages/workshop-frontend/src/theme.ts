@@ -11,15 +11,26 @@
 // follow the light/dark palettes selected by `data-mode` in styles.css. The shared applicator
 // validates the seed before interpolating it into CSS values.
 
+// Principle: the three themes @ps/brand draws (light, navy as `dark`, charcoal), from the
+// generated files in principle/. The choice is the `ps-theme` cookie on principlesvc.app, which
+// the home page writes too, so both open in the same theme. Nothing saved follows the system, with
+// charcoal as the dark. Kumo knows only light and dark, so `data-mode` carries that half.
+
 import { applyAccentColor as applyAccentColorToStyle } from '@gadgets/workshop-shared/theme'
 
-export type ThemeMode = 'light' | 'dark' | 'system'
+export type ThemeMode = 'light' | 'dark' | 'charcoal' | 'system'
 export type ResolvedThemeMode = 'light' | 'dark'
+/** A theme @ps/brand draws, set as `data-theme` on <html>. */
+export type Theme = Exclude<ThemeMode, 'system'>
 
-const THEME_MODE_STORAGE_KEY = 'gadgets:theme-mode'
+export const THEMES: readonly Theme[] = ['light', 'dark', 'charcoal']
 
-function isThemeMode(value: string | null): value is ThemeMode {
-  return value === 'light' || value === 'dark' || value === 'system'
+const THEME_COOKIE = 'ps-theme'
+const PARENT_DOMAIN = 'principlesvc.app'
+const YEAR_S = 365 * 24 * 60 * 60
+
+function isTheme(value: unknown): value is Theme {
+  return THEMES.includes(value as Theme)
 }
 
 export function getSystemThemeMode(): ResolvedThemeMode {
@@ -28,29 +39,53 @@ export function getSystemThemeMode(): ResolvedThemeMode {
 
 export function readThemeMode(): ThemeMode {
   try {
-    const stored = window.localStorage.getItem(THEME_MODE_STORAGE_KEY)
-    return isThemeMode(stored) ? stored : 'system'
+    const saved = new RegExp(`(?:^|;\\s*)${THEME_COOKIE}=([^;]*)`).exec(document.cookie)?.[1]
+    return isTheme(saved) ? saved : 'system'
   } catch {
     return 'system'
   }
 }
 
+/** The cookie that saves `mode`, shared with every principlesvc.app host; `system` clears it. */
+export function themeCookie(
+  mode: ThemeMode,
+  { hostname, protocol }: Pick<Location, 'hostname' | 'protocol'>,
+): string {
+  const shared = hostname === PARENT_DOMAIN || hostname.endsWith(`.${PARENT_DOMAIN}`)
+  return [
+    `${THEME_COOKIE}=${mode === 'system' ? '' : mode}`,
+    'Path=/',
+    `Max-Age=${mode === 'system' ? 0 : YEAR_S}`,
+    'SameSite=Lax',
+    shared ? `Domain=${PARENT_DOMAIN}` : '',
+    protocol === 'https:' ? 'Secure' : '',
+  ].filter(Boolean).join('; ')
+}
+
 export function writeThemeMode(mode: ThemeMode): void {
   try {
-    window.localStorage.setItem(THEME_MODE_STORAGE_KEY, mode)
+    document.cookie = themeCookie(mode, window.location)
   } catch {
     // Ignore storage failures; the selected mode still applies for this session.
   }
 }
 
+/** The theme `mode` draws now: `system` is light or charcoal. */
+export function resolveTheme(mode: ThemeMode): Theme {
+  if (mode !== 'system') return mode
+  return getSystemThemeMode() === 'dark' ? 'charcoal' : 'light'
+}
+
 export function resolveThemeMode(mode: ThemeMode): ResolvedThemeMode {
-  return mode === 'system' ? getSystemThemeMode() : mode
+  return resolveTheme(mode) === 'light' ? 'light' : 'dark'
 }
 
 export function applyThemeMode(mode: ThemeMode): ResolvedThemeMode {
-  const resolved = resolveThemeMode(mode)
+  const theme = resolveTheme(mode)
+  const resolved = resolveThemeMode(theme)
   const root = document.documentElement
 
+  root.setAttribute('data-theme', theme)
   root.setAttribute('data-mode', resolved)
   root.style.colorScheme = resolved
 

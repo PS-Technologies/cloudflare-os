@@ -5,6 +5,7 @@ import TopBarNotice from '../../TopBarNotice'
 import ReconnectingChip from '../ReconnectingChip'
 import { useConnectionLost } from '../../RpcContext'
 import Sidebar from './Sidebar'
+import PrincipleFrame, { PrincipleFrameProvider, PrincipleRail, PrincipleCanvasToggle } from './PrincipleFrame'
 import CommandPalette from './CommandPalette'
 import { OPEN_COMMAND_PALETTE_EVENT } from './commandPaletteBus'
 
@@ -107,11 +108,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }, [])
 
   return (
-    <div className="flex h-full min-h-0 w-full overflow-hidden bg-kumo-base">
+    <PrincipleFrameProvider collapsed={collapsed} onToggleCollapsed={toggleCollapsed}>
+    <div className="relative flex h-full min-h-0 w-full overflow-hidden bg-[var(--sidebar)]">
+      <PrincipleRail />
       {/* Desktop sidebar — hidden on mobile in favor of the drawer. */}
-      <div className="hidden h-full md:flex">
-        <Sidebar collapsed={collapsed} onToggleCollapsed={toggleCollapsed} />
-      </div>
+      <PrincipleFrame>
+        <Sidebar collapsed={false} onToggleCollapsed={toggleCollapsed} />
+      </PrincipleFrame>
 
       {/* Mobile drawer */}
       {mobileOpen && (
@@ -127,16 +130,17 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             aria-modal="true"
             aria-label="Primary navigation"
             tabIndex={-1}
-            className="fixed inset-y-0 left-0 z-50 outline-none md:hidden"
+            className="fixed inset-y-0 left-0 z-50 flex outline-none md:hidden"
           >
-            <Sidebar collapsed={false} onToggleCollapsed={() => setMobileOpen(false)} />
+            <PrincipleRail variant="drawer" />
+            <Sidebar mobile collapsed={false} onToggleCollapsed={() => setMobileOpen(false)} />
           </div>
         </>
       )}
 
       {/* Main column */}
       <div
-        className="flex min-w-0 flex-1 flex-col"
+        className="flex min-w-0 flex-1 flex-col md:isolate md:m-2 md:ml-0 md:rounded-[12px] md:border md:border-[var(--line)] md:bg-[var(--bg)] md:overflow-hidden"
         inert={mobileOpen ? true : undefined}
         aria-hidden={mobileOpen ? true : undefined}
       >
@@ -144,6 +148,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             chrome strip across the top. Mostly empty — carries the mobile hamburger on the left,
             any admin TopBarNotice centered, and the reconnecting chip on the right. */}
         <div className="relative flex h-14 shrink-0 items-center justify-between border-b border-kumo-line bg-kumo-base px-3">
+          <PrincipleCanvasToggle />
           <button
             type="button"
             ref={menuButtonRef}
@@ -169,5 +174,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </div>
+    </PrincipleFrameProvider>
   )
 }
