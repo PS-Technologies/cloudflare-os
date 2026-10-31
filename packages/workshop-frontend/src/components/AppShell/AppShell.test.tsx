@@ -14,6 +14,11 @@ vi.mock('./Sidebar', () => ({
   default: () => <aside data-testid="sidebar" />,
 }))
 
+vi.mock('./PrincipleFrame', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./PrincipleFrame')>()),
+  PrincipleRail: () => null,
+}))
+
 import AppShell from './AppShell'
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
