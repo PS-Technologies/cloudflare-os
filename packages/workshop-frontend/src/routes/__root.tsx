@@ -12,6 +12,8 @@ import { FeatureFlagsProvider } from '../FeatureFlagsContext'
 import Header from '../components/Header'
 import AppShell from '../components/AppShell/AppShell'
 import PrincipleWorkspace from '../components/AppShell/PrincipleWorkspace'
+import PrincipleStartFrame from '../components/PrincipleStartFrame'
+import { PRINCIPLE_START_PATH, usePrincipleStartQuestion } from '../principleStart'
 import LoginPage from '../LoginPage'
 import OnboardingWizard from '../OnboardingWizard'
 import AccountSelectionModal from '../components/billing/AccountSelectionModal'
@@ -35,6 +37,7 @@ function RootComponent() {
   const serverConfig = useServerConfig()
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login } = useAuth(rpcStub)
   const pathname = useRouterState({ select: (s) => s.location.pathname })
+  const startQuestion = usePrincipleStartQuestion()
 
   // Routes that don't require auth (public routes)
   const isSignup = pathname === '/signup'
@@ -50,7 +53,9 @@ function RootComponent() {
 
   // The workspace editor renders fullscreen (no app chrome). /gadget/ is the legacy URL, kept
   // here so the chrome doesn't flash in during the redirect to /workspace/.
-  const isWorkspaceEditor = pathname.startsWith('/workspace/') || pathname.startsWith('/gadget/')
+  const isWorkspaceEditor = pathname.startsWith('/workspace/') || pathname.startsWith('/gadget/') ||
+    // Principle: /start shows a workspace's frame (routes/start.tsx).
+    pathname === PRINCIPLE_START_PATH
 
   const handleLoginSuccess = () => {
     const token = localStorage.getItem('authToken')
@@ -61,6 +66,8 @@ function RootComponent() {
 
   // Loading state
   if (isLoading && !standalone) {
+    // Principle: home's Ask Watts question shows in its workspace frame, not behind a spinner.
+    if (startQuestion !== undefined) return <PrincipleStartPage question={startQuestion} slow={connectionLost} />
     return (
       <div className="flex min-h-full items-center justify-center flex-col gap-4 bg-kumo-base">
         <div className="w-8 h-8 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
@@ -86,6 +93,7 @@ function RootComponent() {
 
   // CF Access mode: show spinner while pipelined auth resolves
   if (!isAuthenticated && CF_ACCESS_MODE && !standalone) {
+    if (startQuestion !== undefined) return <PrincipleStartPage question={startQuestion} />
     return (
       <div className="flex min-h-full items-center justify-center flex-col gap-4 bg-kumo-base">
         <div className="w-8 h-8 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
@@ -165,6 +173,7 @@ function AuthenticatedShell({
 }) {
   // null = still checking, true = needs onboarding, false = onboarding done
   const [onboardingNeeded, setOnboardingNeeded] = useState<boolean | null>(null)
+  const startQuestion = usePrincipleStartQuestion()
 
   useEffect(() => {
     let cancelled = false
@@ -180,6 +189,7 @@ function AuthenticatedShell({
 
   // Still checking onboarding status
   if (onboardingNeeded === null) {
+    if (startQuestion !== undefined) return <PrincipleStartPage question={startQuestion} />
     return (
       <div className="flex min-h-full items-center justify-center flex-col gap-4 bg-kumo-base">
         <div className="w-8 h-8 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
@@ -209,5 +219,14 @@ function AuthenticatedShell({
         </AppShell>
       )}
     </>
+  )
+}
+
+/** Principle: home's Ask Watts question in its workspace frame, beside the rail, as /start shows it. */
+function PrincipleStartPage({ question, slow }: { question: string; slow?: boolean }) {
+  return (
+    <PrincipleWorkspace>
+      <PrincipleStartFrame question={question} slow={slow} />
+    </PrincipleWorkspace>
   )
 }

@@ -20,6 +20,8 @@ import { useAuthenticatedApi } from './AuthContext'
 import { useConnectionLost, useRpcStub } from './RpcContext'
 import UserMenu from './components/UserMenu'
 import PrincipleWorkspaceBack from './components/AppShell/PrincipleWorkspaceBack'
+import PrincipleStartFrame, { PrincipleStartChat } from './components/PrincipleStartFrame'
+import { usePrincipleStart } from './principleStart'
 
 import {
   GadgetClient,
@@ -910,6 +912,8 @@ export default function GadgetEditor() {
     (selectedGadgetId !== null && gadget === null)
   // layoutModeReady survives a failed reopen and its retry, which show error and loading pages.
   const chatRendered = layoutModeReady && !error && !workspaceLoading
+  // Principle: home's Ask Watts question, which /start just sent here, until its chat has loaded.
+  const principleStart = usePrincipleStart(id, chatRendered)
 
   // Wait for all initial subscriptions before choosing the new-workspace chat-only layout.
   // `hasCommittedCode` matters here too: on the first accept the proposed changes clear before the
@@ -1582,6 +1586,21 @@ export default function GadgetEditor() {
     )
   }
 
+  if (workspaceLoading && principleStart !== undefined) {
+    return (
+      <PrincipleStartFrame question={principleStart}>
+        {observerConfig && (
+          <ObserverConfigModal
+            needs={observerConfig.needs}
+            authenticatedApi={authenticatedApi}
+            onConfirm={observerConfig.resolve}
+            onCancel={cancelObserverConfig}
+          />
+        )}
+      </PrincipleStartFrame>
+    )
+  }
+
   if (workspaceLoading) {
     return (
       <div className="flex min-h-full items-center justify-center bg-kumo-base">
@@ -2025,7 +2044,8 @@ export default function GadgetEditor() {
                 />
               </div>
 
-              {!layoutModeReady && (
+              {!layoutModeReady && principleStart !== undefined && <PrincipleStartChat question={principleStart} />}
+              {!layoutModeReady && principleStart === undefined && (
                 <div className="absolute inset-0 flex items-center justify-center bg-kumo-base">
                   <div className="flex flex-col items-center gap-3">
                     <div className="w-6 h-6 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
