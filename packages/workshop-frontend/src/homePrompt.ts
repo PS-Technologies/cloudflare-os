@@ -46,16 +46,17 @@ function urlOf(value: string): URL | undefined {
 /** Set once this page has given out home's question: it is opened once, so it hands over once. */
 let handOffTaken = false;
 
-/**
- * The question home handed this page as it opened, given to the first caller only. The home route
- * claims it as it mounts, so leaving before it is sent and coming back only fills the composer.
- */
+/** Read the eligible question without consuming it during a potentially abandoned render. */
 export function homeHandOff(prompt: string | undefined): string | undefined {
   if (handOffTaken) return undefined;
   const arrival = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
   if (!handedOverFromHome(prompt, { referrer: document.referrer, arrival, dev: import.meta.env.DEV })) {
     return undefined;
   }
-  handOffTaken = true;
   return prompt;
+}
+
+/** Consume the arrival only after the home route commits, including while models are loading. */
+export function claimHomeHandOff(): void {
+  handOffTaken = true;
 }

@@ -12,6 +12,7 @@ import { useSiteName } from '../../ServerConfigContext'
 import { useGatekeeperApps } from '../../useGatekeeperApps'
 import SidebarItem from './SidebarItem'
 import PrincipleSidebarTitle from './PrincipleSidebarTitle'
+import PrincipleConnectorsNav from './PrincipleConnectorsNav'
 import {
   SidebarWorkspacesProvider,
   SidebarWorkspacesTools,
@@ -99,6 +100,7 @@ export default function Sidebar({
               icon={<Stack size={14} weight="regular" />}
               collapsed={collapsed}
             />
+            <PrincipleConnectorsNav collapsed={collapsed} />
             {/* Gatekeeper management apps (e.g. the Context Library), listed dynamically. */}
             {gatekeeperApps.map((app) => {
               // Escape the icon URL for safe interpolation into a CSS url("…") string.

@@ -55,7 +55,7 @@ vi.mock('@tanstack/react-router', () => ({
   useParams: () => ({ id: 'workspace' }),
   useNavigate: () => () => {},
   useSearch: () => ({}),
-  Link: ({ children, to }: { children: ReactNode; to: string }) => <a href={to}>{children}</a>,
+  Link: ({ children, to, ...props }: { children: ReactNode; to: string }) => <a href={to} {...props}>{children}</a>,
 }))
 vi.mock('@cloudflare/kumo', () => {
   const DropdownMenu = Object.assign(
@@ -112,18 +112,18 @@ vi.mock('./BlueprintModal', () => ({ default: () => null }))
 vi.mock('./Connections', () => ({ default: () => null }))
 vi.mock('./GadgetExportMenu', () => ({ default: () => null }))
 vi.mock('./GadgetUI', () => ({ default: () => null }))
-vi.mock('./GadgetUseView', () => ({ default: () => null }))
 vi.mock('./ObserverConfigModal', () => ({ default: () => null }))
 vi.mock('./ShareModal', () => ({ default: () => null }))
 vi.mock('./TopBarNotice', () => ({ default: () => null }))
 vi.mock('./components/DeleteConfirmationDialog', () => ({ default: () => null }))
 vi.mock('./components/ReconnectingChip', () => ({ default: () => null }))
-vi.mock('./components/SiteLogo', () => ({ default: () => null }))
+vi.mock('./components/SiteLogo', () => ({ default: () => <img alt="Workspace logo" /> }))
 vi.mock('./components/UserMenu', () => ({ default: () => null }))
 vi.mock('./components/WorkspaceOpenErrorPage', () => ({ default: () => null }))
 vi.mock('./features/notifications/WorkspaceNotificationsMenu', () => ({ WorkspaceNotificationsMenu: () => null }))
 
 import GadgetEditor from './GadgetEditor'
+import GadgetUseView from './GadgetUseView'
 
 let container: HTMLDivElement
 let root: Root
@@ -173,4 +173,35 @@ it('fits a width saved in a wider window to the editor once it opens', async () 
   await act(async () => { root.render(<GadgetEditor />) })
   const chat = container.querySelector<HTMLElement>('.cursor-col-resize')!.previousElementSibling as HTMLElement
   expect(chat.style.width).toBe(`${946 - 400}px`)
+})
+
+
+it('replaces the workspace logo with a labelled return to Dispatch at every width', async () => {
+  await act(async () => { root.render(<GadgetEditor />) })
+  const back = container.querySelector('a[aria-label="Back to Dispatch"]')!
+  expect(back).not.toBeNull()
+  expect(back.getAttribute('href')).toBe('/')
+  expect(back.textContent).toBe('Dispatch')
+  expect(back.className).not.toMatch(/(?:^|\s)(?:hidden|(?:sm|md):hidden)(?:$|\s)/)
+  expect(container.querySelector('img[alt="Workspace logo"]')).toBeNull()
+})
+
+it('keeps a labelled way out of a use-only workspace without a second badge', async () => {
+  await act(async () => {
+    root.render(<GadgetUseView
+      overseer={mocks.workspace.overseer.stub as unknown as ComponentProps<typeof GadgetUseView>['overseer']}
+      gadget={null}
+      selectedGadgetId={null}
+      gadgets={[]}
+      onSelectGadget={() => {}}
+      metadata={mocks.workspace.metadata}
+      authenticatedApi={mocks.authenticatedApi as unknown as ComponentProps<typeof GadgetUseView>['authenticatedApi']}
+      currentUserId="dev"
+    />)
+  })
+  const back = container.querySelector('a[aria-label="Back to Dispatch"]')!
+  expect(back).not.toBeNull()
+  expect(back.getAttribute('href')).toBe('/')
+  expect(back.textContent).toBe('Dispatch')
+  expect(container.querySelector('img[alt="Workspace logo"]')).toBeNull()
 })

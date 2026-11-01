@@ -45,3 +45,17 @@ describe('Sidebar frame', () => {
     expect(sidebar.querySelector('a[aria-label="Gatekeepers"]')).toBeNull()
   })
 })
+
+
+it.each([{ mobile: false, surface: 'desktop sidebar' }, { mobile: true, surface: 'mobile drawer' }])('provides one labelled Connectors row in the $surface', ({ mobile }) => {
+  const container = document.createElement('div')
+  const root = createRoot(container)
+  try {
+    act(() => root.render(<PrincipleFrameProvider collapsed={false} onToggleCollapsed={() => {}}><Sidebar mobile={mobile} collapsed={false} onToggleCollapsed={() => {}} /></PrincipleFrameProvider>))
+    const links = container.querySelectorAll('aside nav a[href="/gatekeepers"]')
+    expect(links).toHaveLength(1)
+    expect(links[0].textContent).toBe('Connectors')
+  } finally {
+    act(() => root.unmount())
+  }
+})

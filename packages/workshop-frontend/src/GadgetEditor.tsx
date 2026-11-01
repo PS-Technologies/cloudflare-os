@@ -1,12 +1,11 @@
 import { useState, useEffect, useCallback, useMemo, useRef, type PointerEvent as ReactPointerEvent } from 'react'
-import { useParams, useNavigate, useSearch, Link } from '@tanstack/react-router'
+import { useParams, useNavigate, useSearch } from '@tanstack/react-router'
 import { DropdownMenu, useKumoToastManager } from '@cloudflare/kumo'
 import {
   ShareNetwork,
   Pencil,
   Check,
   X,
-  Hexagon,
   Blueprint,
   Trash,
   ArrowsOutSimple,
@@ -20,7 +19,7 @@ import { RpcStub, RpcTarget } from 'capnweb'
 import { useAuthenticatedApi } from './AuthContext'
 import { useConnectionLost, useRpcStub } from './RpcContext'
 import UserMenu from './components/UserMenu'
-import SiteLogo from './components/SiteLogo'
+import PrincipleWorkspaceBack from './components/AppShell/PrincipleWorkspaceBack'
 
 import {
   GadgetClient,
@@ -1641,15 +1640,7 @@ export default function GadgetEditor() {
         <TopBarNotice />
         {/* Left: logo / title */}
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          <Link
-            to="/"
-            aria-label="Home"
-            className="flex-shrink-0 hover:opacity-80 transition-opacity"
-          >
-            <SiteLogo size={22}>
-              <Hexagon size={22} className="text-kumo-brand" weight="bold" />
-            </SiteLogo>
-          </Link>
+          <PrincipleWorkspaceBack />
 
           <span className="text-kumo-inactive flex-shrink-0">/</span>
 
