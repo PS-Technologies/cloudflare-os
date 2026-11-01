@@ -1,32 +1,33 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
-// Principle: the home page's Ask Watts hands a question to Dispatch's home route to send at once.
+// Principle: the home page's Ask Watts hands a question to Dispatch. The home route sends it on to
+// /start before anything renders, and /start opens a chat with it in a new workspace, showing the
+// question and Watts thinking from the first frame.
 
-import { act, StrictMode, Suspense } from "react";
+import { act, StrictMode, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const testState = vi.hoisted(() => {
+  const dispose = vi.fn<() => void>();
   const workspace = {
     newChat: vi.fn<(...args: unknown[]) => Promise<number>>(async () => 0),
     getMetadata: vi.fn<() => Promise<{ id: string }>>(async () => ({ id: "workspace-1" })),
-    [Symbol.dispose]: () => {},
+    [Symbol.dispose]: dispose,
   };
   const listModels = vi.fn<() => Promise<Array<{ id: string }>>>(
     async () => [{ id: "model-a" }, { id: "model-b" }]);
   const newWorkspace = vi.fn<() => typeof workspace>(() => workspace);
   return {
-    addToast: vi.fn<(toast: unknown) => void>(),
     authenticatedApi: { listModels, newWorkspace },
     currentUser: { id: "user-a", name: "User A" },
+    dispose,
     listModels,
-    navigate: vi.fn<(options: unknown) => Promise<void> | void>(),
+    navigate: vi.fn<(options: unknown) => Promise<void>>(async () => {}),
     realNavigation: false,
-    suspendComposer: undefined as Promise<void> | undefined,
     newWorkspace,
     workspace,
-    seeds: [] as Array<{ text?: string; nonce?: number }>,
   };
 });
 
@@ -35,11 +36,15 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
   return {
     ...original,
     useNavigate: () => testState.realNavigation ? original.useNavigate() : testState.navigate,
+    Link: ({ children, to, ...props }: { children: ReactNode; to: string }) =>
+      <a href={to} {...props}>{children}</a>,
   };
 });
 
-vi.mock("@cloudflare/kumo", () => ({
-  useKumoToastManager: () => ({ add: testState.addToast }),
+vi.mock("@cloudflare/kumo", () => ({ useKumoToastManager: () => ({ add: () => {} }) }));
+vi.mock("./components/WorkshopControls", () => ({
+  WorkshopButton: ({ children, tone: _tone, ...props }: ComponentProps<"button"> & { tone?: string }) =>
+    <button type="button" {...props}>{children}</button>,
 }));
 
 vi.mock("./AuthContext", () => ({
@@ -49,135 +54,131 @@ vi.mock("./AuthContext", () => ({
   }),
 }));
 
-vi.mock("./features/chat/composer/ChatComposer", () => ({
-  ChatComposer: ({ seedText, seedNonce, blockedReason }:
-    { seedText?: string; seedNonce?: number; blockedReason?: string }) => {
-    if (testState.suspendComposer) throw testState.suspendComposer;
-    testState.seeds.push({ text: seedText, nonce: seedNonce });
-    return <textarea aria-label="Prompt" readOnly disabled={blockedReason !== undefined}
-      value={seedText ?? ""} />;
-  },
-}));
-
+// The home page itself never renders for a hand-off; these keep its route module importable.
+vi.mock("./features/chat/composer/ChatComposer", () => ({ ChatComposer: () => <textarea aria-label="Prompt" /> }));
 vi.mock("./components/MeshBackground", () => ({ default: () => null }));
-vi.mock("./components/AppShell/HomeTaskSuggestions", () => ({
-  default: ({ onPick }: { onPick: (suggestion: string) => void }) =>
-    <button type="button" onClick={() => onPick(SUGGESTION)}>Suggestion</button>,
-}));
+vi.mock("./components/AppShell/HomeTaskSuggestions", () => ({ default: () => null }));
 vi.mock("./features/deployment-updates/UpdateAvailableNotice", () => ({ UpdateAvailableNotice: () => null }));
 vi.mock("./useDocumentTitle", () => ({ useDocumentTitle: () => {} }));
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const QUESTION = "Summarize the LCRA T-FCC bid";
-const SUGGESTION = "Draft a status update";
-const OPENED_FOR_QUESTION =
-  `https://dispatch.principlesvc.app/?${new URLSearchParams({ prompt: JSON.stringify(QUESTION), send: "1" })}`;
+const ASKED = new URLSearchParams({ prompt: JSON.stringify(QUESTION), send: "1" });
+const OPENED_FOR_QUESTION = `https://dispatch.principlesvc.app/?${ASKED}`;
+const START_ADDRESS = `/start?${new URLSearchParams({ prompt: JSON.stringify(QUESTION) })}`;
+const TO_WORKSPACE = {
+  to: "/workspace/$id", params: { id: "workspace-1" }, search: { chat: 0 }, replace: true,
+};
+const BACK_HOME = { to: "/", search: { prompt: QUESTION }, replace: true };
 
 /** The page as the browser opened it: from `referrer`, at `opened`. */
-function arrive(referrer: string, opened = OPENED_FOR_QUESTION) {
+function arrive(referrer: string, opened = OPENED_FOR_QUESTION, type = "navigate") {
   Object.defineProperty(document, "referrer", { value: referrer, configurable: true });
   vi.spyOn(performance, "getEntriesByType").mockReturnValue(
-    [{ name: opened, type: "navigate" } as unknown as PerformanceEntry]);
+    [{ name: opened, type } as unknown as PerformanceEntry]);
 }
 
-const seededWith = (text: string) => testState.seeds.some((seed) => seed.text === text);
-const composer = () => document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Prompt"]')!;
-
-/** A send that waits until the test settles it. */
-function sendHeld() {
-  let fail!: (err: Error) => void;
-  testState.workspace.newChat.mockImplementationOnce(
-    () => new Promise((_, reject) => { fail = reject; }));
-  return { fail: (err: Error) => act(async () => fail(err)) };
+/** A promise the test settles. */
+function held<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
 }
+
+const bubble = () => document.querySelector(".bg-kumo-bubble-user");
+const text = () => document.body.textContent ?? "";
+const tryAgain = () => [...document.querySelectorAll("button")].find((b) => b.textContent === "Try again")!;
+/** Lets the start's queued work and the promises it awaits run. */
+async function settle() {
+  for (let turn = 0; turn < 5; turn++) {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  }
+}
+
+const workspaceOpened = () =>
+  testState.navigate.mock.calls.some(([options]) => (options as { to: string }).to === "/workspace/$id");
 
 describe("Home's Ask Watts hand-off", () => {
   let container: HTMLDivElement | undefined;
   let root: Root | undefined;
 
-  async function renderHome(prompt: string | undefined) {
-    const { HomePageContent } = await import("./routes/index");
+  /** /start as the router mounts it, under StrictMode as main.tsx renders it. */
+  async function renderStart(prompt: string | undefined) {
+    const { StartPageContent } = await import("./routes/start");
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
-    // As main.tsx renders it: StrictMode calls state initializers twice and mounts effects twice.
-    await act(async () => root!.render(<StrictMode><HomePageContent prompt={prompt} /></StrictMode>));
+    await act(async () => root!.render(<StrictMode><StartPageContent prompt={prompt} /></StrictMode>));
   }
 
-  async function leaveHome() {
+  /** /start rendered again in place, as a change in what it reads from its context does. */
+  async function rerenderStart(prompt: string | undefined) {
+    const { StartPageContent } = await import("./routes/start");
+    await act(async () => root!.render(<StrictMode><StartPageContent prompt={prompt} /></StrictMode>));
+  }
+
+  async function leave() {
     await act(async () => root?.unmount());
     container?.remove();
+    root = undefined;
   }
 
   beforeEach(() => {
-    // The hand-off is taken once per page, so every test opens a fresh one.
+    // The hand-off is taken once per page, and the pending start lives in memory, so every test
+    // opens a fresh page.
     vi.resetModules();
-    testState.navigate.mockReset();
     testState.realNavigation = false;
-    testState.suspendComposer = undefined;
   });
 
   afterEach(async () => {
-    await leaveHome();
+    vi.useRealTimers();
+    await leave();
+    testState.authenticatedApi = { listModels: testState.listModels, newWorkspace: testState.newWorkspace };
     Reflect.deleteProperty(document, "referrer");
     localStorage.clear();
-    testState.seeds.length = 0;
     testState.listModels.mockReset();
+    testState.listModels.mockImplementation(async () => [{ id: "model-a" }, { id: "model-b" }]);
+    testState.navigate.mockReset();
+    testState.navigate.mockImplementation(async () => {});
     vi.restoreAllMocks();
     vi.clearAllMocks();
   });
 
-  it("does not lose the question when the initial home render is retried before committing", async () => {
-    const { HomePageContent } = await import("./routes/index");
-    arrive("https://home.principlesvc.app/");
-    let resume!: () => void;
-    testState.suspendComposer = new Promise<void>((resolve) => { resume = resolve; });
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    await act(async () => root!.render(
-      <StrictMode><Suspense fallback={<p>Loading home</p>}>
-        <HomePageContent prompt={QUESTION} />
-      </Suspense></StrictMode>,
-    ));
-    expect(testState.newWorkspace).not.toHaveBeenCalled();
-    await act(async () => {
-      testState.suspendComposer = undefined;
-      resume();
-    });
-    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
-    expect(testState.workspace.newChat.mock.calls[0]?.slice(0, 2)).toEqual([QUESTION, "model-a"]);
-    expect(testState.navigate).toHaveBeenCalledWith({
-      to: "/workspace/$id", params: { id: "workspace-1" }, search: { chat: 0 },
-    });
-    expect(seededWith(QUESTION)).toBe(false);
-  });
-
-  it("keeps the question while models load after the real router clears the arrival URL", async () => {
+  it("sends a home hand-off at / on to /start before the home page renders, then into its workspace", async () => {
     const { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider, Outlet } =
       await import("@tanstack/react-router");
-    const { HomePageContent, Route } = await import("./routes/index");
+    const { Route: HomeRoute } = await import("./routes/index");
+    const { Route: StartRoute, StartPageContent } = await import("./routes/start");
     testState.realNavigation = true;
-    let loadModels!: (models: Array<{ id: string }>) => void;
-    testState.listModels.mockImplementation(() => new Promise((resolve) => { loadModels = resolve; }));
     arrive("https://home.principlesvc.app/");
+    const homeRendered = vi.fn<() => void>();
     const rootRoute = createRootRoute({ component: Outlet });
     const homeRoute = createRoute({
       getParentRoute: () => rootRoute,
       path: "/",
-      validateSearch: Route.options.validateSearch,
-      component: () => <HomePageContent prompt={homeRoute.useSearch().prompt} />,
+      validateSearch: HomeRoute.options.validateSearch,
+      beforeLoad: HomeRoute.options.beforeLoad,
+      component: () => { homeRendered(); return <p>Home page</p>; },
+    });
+    const startRoute = createRoute({
+      getParentRoute: () => rootRoute,
+      path: "/start",
+      validateSearch: StartRoute.options.validateSearch,
+      component: () => <StartPageContent prompt={startRoute.useSearch().prompt} />,
     });
     const workspaceRoute = createRoute({
       getParentRoute: () => rootRoute,
       path: "/workspace/$id",
       component: () => <p>Workspace chat</p>,
     });
+    const history = createMemoryHistory({ initialEntries: [`/?${ASKED}`] });
     const router = createRouter({
-      routeTree: rootRoute.addChildren([homeRoute, workspaceRoute]),
-      history: createMemoryHistory({ initialEntries: [new URL(OPENED_FOR_QUESTION).pathname + new URL(OPENED_FOR_QUESTION).search] }),
+      routeTree: rootRoute.addChildren([homeRoute, startRoute, workspaceRoute]),
+      history,
     });
+    let loadModels!: (models: Array<{ id: string }>) => void;
+    testState.listModels.mockImplementation(() => new Promise((resolve) => { loadModels = resolve; }));
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -185,116 +186,248 @@ describe("Home's Ask Watts hand-off", () => {
       await router.load();
       root!.render(<StrictMode><RouterProvider router={router} /></StrictMode>);
     });
-    expect(router.state.location.search).toEqual({});
-    expect(testState.newWorkspace).not.toHaveBeenCalled();
-    expect(composer().disabled).toBe(true);
+    await settle();
+
+    expect(router.state.location.pathname).toBe("/start");
+    expect(router.state.location.search).toEqual({ prompt: QUESTION });
+    expect(homeRendered).not.toHaveBeenCalled();
+    expect(bubble()?.textContent).toBe(QUESTION);
+
     await act(async () => loadModels([{ id: "model-a" }]));
+    await settle();
     expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
     expect(router.state.location.pathname).toBe("/workspace/workspace-1");
     expect(router.state.location.search).toEqual({ chat: 0 });
+    // Both moves replaced the page's entry, so Back leaves for home rather than starting again.
+    expect(history.length).toBe(1);
+    expect(homeRendered).not.toHaveBeenCalled();
   });
 
-  it("sends the question with the saved model and opens the conversation, never filling the composer", async () => {
+  it("leaves / alone when the page was not handed a question by home", async () => {
+    const { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider, Outlet } =
+      await import("@tanstack/react-router");
+    const { Route: HomeRoute } = await import("./routes/index");
+    testState.realNavigation = true;
+    arrive("https://evil.example/");
+    const rootRoute = createRootRoute({ component: Outlet });
+    const homeRoute = createRoute({
+      getParentRoute: () => rootRoute,
+      path: "/",
+      validateSearch: HomeRoute.options.validateSearch,
+      beforeLoad: HomeRoute.options.beforeLoad,
+      component: () => <p>Home page</p>,
+    });
+    const startRoute = createRoute({ getParentRoute: () => rootRoute, path: "/start", component: () => null });
+    const router = createRouter({
+      routeTree: rootRoute.addChildren([homeRoute, startRoute]),
+      history: createMemoryHistory({ initialEntries: [`/?${ASKED}`] }),
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => {
+      await router.load();
+      root!.render(<RouterProvider router={router} />);
+    });
+
+    expect(router.state.location.pathname).toBe("/");
+    expect(text()).toContain("Home page");
+  });
+
+  it("shows the question and Watts thinking at once, then sends it once with the saved model", async () => {
     localStorage.setItem("lastSelectedModel", "model-b");
     arrive("https://home.principlesvc.app/");
-    await renderHome(QUESTION);
+    await renderStart(QUESTION);
 
+    expect(bubble()?.textContent).toBe(QUESTION);
+    expect(text()).toContain("Thinking");
+    expect(document.querySelector('[aria-busy="true"]')).not.toBeNull();
+    await settle();
+
+    expect(testState.newWorkspace).toHaveBeenCalledTimes(1);
     expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
-    expect(testState.workspace.newChat.mock.calls[0]?.slice(0, 2)).toEqual([QUESTION, "model-b"]);
-    expect(testState.navigate).toHaveBeenCalledWith(
-      { to: "/workspace/$id", params: { id: "workspace-1" }, search: { chat: 0 } });
-    // Filling the composer would save a draft of a question that has already gone.
-    expect(seededWith(QUESTION)).toBe(false);
+    expect(testState.workspace.newChat.mock.calls[0]).toEqual([QUESTION, "model-b"]);
+    expect(testState.navigate).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).toHaveBeenCalledWith(TO_WORKSPACE);
+    expect(testState.dispose).toHaveBeenCalledTimes(1);
+    const { principleStartFor } = await import("./principleStart");
+    expect(principleStartFor("workspace-1")).toEqual({ id: "workspace-1", chat: 0, question: QUESTION });
   });
 
-  it("restores the question to the composer if opening the sent workspace fails", async () => {
-    testState.navigate.mockImplementation((options) => {
-      if ((options as { to: string }).to === "/workspace/$id") {
-        return Promise.reject(new Error("Navigation interrupted"));
-      }
-    });
+  it("falls back to the first model when the saved one is gone", async () => {
+    localStorage.setItem("lastSelectedModel", "model-retired");
     arrive("https://home.principlesvc.app/");
-    await renderHome(QUESTION);
+    await renderStart(QUESTION);
+    await settle();
 
-    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
-    expect(composer().disabled).toBe(false);
-    expect(seededWith(QUESTION)).toBe(true);
+    expect(testState.workspace.newChat.mock.calls[0]).toEqual([QUESTION, "model-a"]);
   });
 
-  it("leaves the question in the composer when the send fails", async () => {
+  it("honours a saved choice of no agent, as Send would", async () => {
+    const { NO_AGENT_OPTION_VALUE } = await import("./modelSelection");
+    localStorage.setItem("lastSelectedModel", NO_AGENT_OPTION_VALUE);
+    arrive("https://home.principlesvc.app/");
+    await renderStart(QUESTION);
+    await settle();
+
+    expect(testState.workspace.newChat.mock.calls[0]).toEqual([QUESTION, null]);
+  });
+
+  it("starts nothing more under StrictMode's second mount", async () => {
+    arrive("https://home.principlesvc.app/");
+    await renderStart(QUESTION);
+    await settle();
+
+    expect(testState.newWorkspace).toHaveBeenCalledTimes(1);
+    expect(testState.listModels).toHaveBeenCalledTimes(1);
+    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts once when its API is replaced mid-start, and opens that chat's workspace", async () => {
+    const chat = held<number>();
+    testState.workspace.newChat.mockImplementationOnce(() => chat.promise);
+    arrive("https://home.principlesvc.app/");
+    await renderStart(QUESTION);
+    await settle();
+    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
+
+    // Signing in again hands /start a new API while the chat is being made.
+    testState.authenticatedApi = { ...testState.authenticatedApi };
+    await rerenderStart(QUESTION);
+    await settle();
+    await act(async () => chat.resolve(0));
+    await settle();
+
+    expect(testState.newWorkspace).toHaveBeenCalledTimes(1);
+    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).toHaveBeenCalledWith(TO_WORKSPACE);
+    expect(testState.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not open the workspace after the person has left, and lets the workspace go once its calls settle", async () => {
+    const chat = held<number>();
+    testState.workspace.newChat.mockImplementationOnce(() => chat.promise);
+    arrive("https://home.principlesvc.app/");
+    await renderStart(QUESTION);
+    await settle();
+    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
+
+    await leave();
+    expect(testState.dispose).not.toHaveBeenCalled();
+    await act(async () => chat.resolve(0));
+    await settle();
+    expect(workspaceOpened()).toBe(false);
+    expect(testState.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the question when the start fails, and Try again starts afresh", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     testState.workspace.newChat.mockRejectedValueOnce(new Error("Model is disabled"));
     arrive("https://home.principlesvc.app/");
-    await renderHome(QUESTION);
+    await renderStart(QUESTION);
+    await settle();
 
-    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
-    expect(seededWith(QUESTION)).toBe(true);
-    expect(testState.navigate).not.toHaveBeenCalledWith(expect.objectContaining({ to: "/workspace/$id" }));
+    expect(bubble()?.textContent).toBe(QUESTION);
+    expect(document.querySelector('[role="alert"]')?.textContent).toBe("Couldn't start this chat.");
+    expect(text()).not.toContain("Thinking");
+    expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+    expect(workspaceOpened()).toBe(false);
+    expect(testState.dispose).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith("Failed to create gadget:", expect.any(Error));
+
+    await act(async () => tryAgain().click());
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    expect(text()).toContain("Thinking");
+    await settle();
+
+    expect(testState.newWorkspace).toHaveBeenCalledTimes(2);
+    expect(testState.workspace.newChat).toHaveBeenCalledTimes(2);
+    expect(testState.navigate).toHaveBeenCalledWith(TO_WORKSPACE);
   });
 
-  it("closes the composer while the question is on its way, and opens it with the question if it fails", async () => {
-    const send = sendHeld();
-    arrive("https://home.principlesvc.app/");
-    await renderHome(QUESTION);
-
-    // Open, a second send would start another chat in the same workspace.
-    expect(composer().disabled).toBe(true);
-    await send.fail(new Error("Model is disabled"));
-    expect(composer().disabled).toBe(false);
-    expect(seededWith(QUESTION)).toBe(true);
-  });
-
-  it("keeps a suggestion picked while the question is on its way when the send fails", async () => {
-    const send = sendHeld();
-    arrive("https://home.principlesvc.app/");
-    await renderHome(QUESTION);
-    await act(async () => document.querySelector("button")!.click());
-    await send.fail(new Error("Model is disabled"));
-
-    expect(testState.seeds.at(-1)?.text).toBe(SUGGESTION);
-    expect(seededWith(QUESTION)).toBe(false);
-  });
-
-  it("leaves the question in the composer when the models do not load, without sending", async () => {
+  it("shows the failure when the models do not load, without sending", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
     testState.listModels.mockRejectedValue(new Error("Models unavailable"));
     arrive("https://home.principlesvc.app/");
-    await renderHome(QUESTION);
+    await renderStart(QUESTION);
+    await settle();
 
-    expect(testState.newWorkspace).not.toHaveBeenCalled();
-    expect(seededWith(QUESTION)).toBe(true);
-    expect(composer().disabled).toBe(false);
+    expect(testState.workspace.newChat).not.toHaveBeenCalled();
+    expect(bubble()?.textContent).toBe(QUESTION);
+    expect(document.querySelector('[role="alert"]')?.textContent).toBe("Couldn't start this chat.");
+    expect(testState.dispose).toHaveBeenCalledTimes(1);
+    expect(workspaceOpened()).toBe(false);
   });
 
-  it("only fills the composer when the page was opened from anywhere but home", async () => {
-    arrive("https://evil.example/");
-    await renderHome(QUESTION);
+  it("opens the chat it already started, not another, when Try again follows a failed move", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    testState.navigate.mockRejectedValueOnce(new Error("Navigation interrupted"));
+    arrive("https://home.principlesvc.app/");
+    await renderStart(QUESTION);
+    await settle();
+    expect(document.querySelector('[role="alert"]')).not.toBeNull();
 
-    expect(testState.newWorkspace).not.toHaveBeenCalled();
-    expect(seededWith(QUESTION)).toBe(true);
-    expect(composer().disabled).toBe(false);
+    await act(async () => tryAgain().click());
+    await settle();
+    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).toHaveBeenCalledTimes(2);
+    expect(testState.navigate).toHaveBeenLastCalledWith(TO_WORKSPACE);
   });
 
-  it("gives the question up on leaving before the models load: coming back with it only fills the composer", async () => {
+  it.each([
+    ["opened from anywhere but home", () => arrive("https://evil.example/")],
+    ["reloaded", () => arrive("https://home.principlesvc.app/", OPENED_FOR_QUESTION, "reload")],
+    ["visited directly", () => arrive("https://home.principlesvc.app/", `https://dispatch.principlesvc.app${START_ADDRESS}`)],
+  ])("only fills the home composer when /start was %s", async (_case, open) => {
+    open();
+    await renderStart(QUESTION);
+    await settle();
+
+    expect(testState.navigate).toHaveBeenCalledWith(BACK_HOME);
+    expect(testState.newWorkspace).not.toHaveBeenCalled();
+    expect(testState.listModels).not.toHaveBeenCalled();
+    expect(bubble()).toBeNull();
+  });
+
+  it("starts once per page: coming back to /start only fills the home composer", async () => {
+    arrive("https://home.principlesvc.app/");
+    await renderStart(QUESTION);
+    await settle();
+    await leave();
+    testState.navigate.mockClear();
+
+    await renderStart(QUESTION);
+    await settle();
+    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).toHaveBeenCalledWith(BACK_HOME);
+  });
+
+  it("says it is still starting once the start has taken eight seconds", async () => {
+    vi.useFakeTimers();
     testState.listModels.mockImplementation(() => new Promise(() => {}));
     arrive("https://home.principlesvc.app/");
-    await renderHome(QUESTION);
-    await leaveHome();
-    testState.listModels.mockReset();
+    await renderStart(QUESTION);
 
-    // A gatekeeper app opening Dispatch's home with the same question, without asking to send it.
-    await renderHome(QUESTION);
-    expect(testState.newWorkspace).not.toHaveBeenCalled();
-    expect(seededWith(QUESTION)).toBe(true);
+    await act(async () => { vi.advanceTimersByTime(7_999); });
+    expect(text()).not.toContain("Still starting");
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(document.querySelector('[role="status"]')?.textContent).toBe("Still starting");
+    expect(text()).toContain("Thinking");
   });
 
-  it("sends once per page: coming back with the same address only fills the composer", async () => {
+  it("counts the eight seconds from the start, though its API is replaced on the way", async () => {
+    vi.useFakeTimers();
+    testState.listModels.mockImplementation(() => new Promise(() => {}));
     arrive("https://home.principlesvc.app/");
-    await renderHome(QUESTION);
-    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
-    await leaveHome();
+    await renderStart(QUESTION);
 
-    // An in-app link back to the same address keeps home as the referrer and the same opening entry.
-    await renderHome(QUESTION);
-    expect(testState.workspace.newChat).toHaveBeenCalledTimes(1);
-    expect(seededWith(QUESTION)).toBe(true);
+    await act(async () => { vi.advanceTimersByTime(5_000); });
+    testState.authenticatedApi = { ...testState.authenticatedApi };
+    await rerenderStart(QUESTION);
+    await act(async () => { vi.advanceTimersByTime(3_000); });
+    expect(document.querySelector('[role="status"]')?.textContent).toBe("Still starting");
+    expect(testState.newWorkspace).toHaveBeenCalledTimes(1);
   });
 });

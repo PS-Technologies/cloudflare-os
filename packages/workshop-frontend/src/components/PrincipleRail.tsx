@@ -1,4 +1,4 @@
-import { useAuthenticatedApi } from '../AuthContext'
+import { useOptionalAuthenticatedApi } from '../AuthContext'
 import { useTheme } from '../ThemeContext'
 import { resolveTheme } from '../theme'
 import { AppRail } from '../principle-rail/app-rail'
@@ -10,7 +10,8 @@ import { AppRail } from '../principle-rail/app-rail'
  * from `md` up; `drawer` rides in the mobile drawer.
  */
 const PrincipleRail = ({ variant = 'column' }: { variant?: 'column' | 'drawer' }) => {
-  const { currentUser } = useAuthenticatedApi()
+  // Optional: the root shows it before sign-in, around home's Ask Watts question (principleStart.ts).
+  const currentUser = useOptionalAuthenticatedApi()?.currentUser
   const { themeMode, setThemeMode } = useTheme()
   const rail = (
     <AppRail

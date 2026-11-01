@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 /* eslint-disable react/react-in-jsx-scope */
 
-import { act, useEffect, type ComponentProps, type ReactElement, type ReactNode } from 'react'
+import { act, useEffect, useState, type ComponentProps, type ReactElement, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { afterAll, afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { GadgetSummary, WorkspaceMetadata, WorkpiecesSubscriber } from '@gadgets/workshop-shared/api'
 
 // Principle: the frame sets the gadget editor in a card right of the rail, so the divider between
@@ -39,11 +39,17 @@ const mocks = vi.hoisted(() => {
       metadata: { id: 'workspace', title: 'Trips', role: 'build' } as unknown as WorkspaceMetadata,
       error: null,
       connectionLost: false,
-      observerConfig: null,
+      observerConfig: null as { needs: unknown[]; resolve: () => void } | null,
       retry: () => {},
       cancelObserverConfig: () => {},
       updateTitle: () => {},
     },
+    // Principle: whether the workspace has opened, and whether its chats have been listed.
+    opened: true,
+    chatsListed: true,
+    listChats: () => {},
+    // What the chat pane found of a start from home when it mounted.
+    chatTook: undefined as unknown,
     authenticatedApi: {
       whoami: async () => ({ type: 'user', id: 'dev', name: 'Dev' }),
       listWorkspaces: async () => [],
@@ -73,14 +79,24 @@ vi.mock('@cloudflare/kumo', () => {
 })
 vi.mock('./AuthContext', () => ({ useAuthenticatedApi: () => ({ authenticatedApi: mocks.authenticatedApi }) }))
 vi.mock('./RpcContext', () => ({ useConnectionLost: () => false, useRpcStub: () => ({}) }))
-vi.mock('./useWorkspaceOpen', () => ({ useWorkspaceOpen: () => mocks.workspace }))
+vi.mock('./useWorkspaceOpen', () => ({
+  useWorkspaceOpen: () => ({ ...mocks.workspace, metadata: mocks.opened ? mocks.workspace.metadata : null }),
+}))
 vi.mock('./useActions', () => ({ useActions: () => ({ pending: [] }), useActionEntries: () => {} }))
 vi.mock('./errorReporting', () => ({ reportIssue: () => {} }))
 vi.mock('./features/blueprint-updates/useBlueprintUpdateAvailable', () => ({ useBlueprintUpdateAvailable: () => false }))
 vi.mock('./features/blueprint-updates/UpdateFromBlueprintDialog', () => ({ UpdateFromBlueprintDialog: () => null }))
 vi.mock('./ChatInterface', () => ({
-  default: ({ onChatCountChange }: { onChatCountChange: (count: number, hasChatZero: boolean) => void }) => {
-    useEffect(() => { onChatCountChange(0, false) }, [onChatCountChange])
+  default: ({ onChatCountChange, workspaceId }: {
+    onChatCountChange: (count: number, hasChatZero: boolean) => void
+    workspaceId: string
+  }) => {
+    const [took] = useState(() => principleStartFor(workspaceId))
+    mocks.chatTook = took
+    useEffect(() => {
+      mocks.listChats = () => onChatCountChange(0, false)
+      if (mocks.chatsListed) onChatCountChange(0, false)
+    }, [onChatCountChange])
     return <div>chat pane</div>
   },
 }))
@@ -112,7 +128,7 @@ vi.mock('./BlueprintModal', () => ({ default: () => null }))
 vi.mock('./Connections', () => ({ default: () => null }))
 vi.mock('./GadgetExportMenu', () => ({ default: () => null }))
 vi.mock('./GadgetUI', () => ({ default: () => null }))
-vi.mock('./ObserverConfigModal', () => ({ default: () => null }))
+vi.mock('./ObserverConfigModal', () => ({ default: () => <div data-testid="observer-config" /> }))
 vi.mock('./ShareModal', () => ({ default: () => null }))
 vi.mock('./TopBarNotice', () => ({ default: () => null }))
 vi.mock('./components/DeleteConfirmationDialog', () => ({ default: () => null }))
@@ -124,6 +140,7 @@ vi.mock('./features/notifications/WorkspaceNotificationsMenu', () => ({ Workspac
 
 import GadgetEditor from './GadgetEditor'
 import GadgetUseView from './GadgetUseView'
+import { clearPrincipleStart, principleStartFor, recordPrincipleStart } from './principleStart'
 
 let container: HTMLDivElement
 let root: Root
@@ -204,4 +221,81 @@ it('keeps a labelled way out of a use-only workspace without a second badge', as
   expect(back.getAttribute('href')).toBe('/')
   expect(back.textContent).toBe('Dispatch')
   expect(container.querySelector('img[alt="Workspace logo"]')).toBeNull()
+})
+
+// Principle: a chat started from home's Ask Watts (routes/start.tsx) keeps showing the question and
+// Watts thinking while its workspace opens, where the editor would show its loading spinners.
+const QUESTION = 'Summarize the LCRA T-FCC bid'
+const START = { id: 'workspace', chat: 4, question: QUESTION }
+const bubble = () => container.querySelector('.bg-kumo-bubble-user')
+
+describe('a chat started from home', () => {
+
+  afterEach(() => {
+    mocks.opened = true
+    mocks.chatsListed = true
+    mocks.workspace.observerConfig = null
+    clearPrincipleStart('workspace')
+    clearPrincipleStart('other')
+    mocks.chatTook = undefined
+  })
+
+  it('shows the question and Watts thinking while its workspace opens, not a spinner', async () => {
+    recordPrincipleStart(START)
+    mocks.opened = false
+    mocks.workspace.observerConfig = { needs: [], resolve: () => {} }
+    await act(async () => { root.render(<GadgetEditor />) })
+
+    expect(bubble()?.textContent).toBe(QUESTION)
+    expect(container.textContent).toContain('Thinking')
+    expect(container.textContent).not.toContain('Loading workspace…')
+    expect(container.querySelector('.animate-spin')).toBeNull()
+    expect(container.querySelector('a[aria-label="Back to Dispatch"]')).not.toBeNull()
+    // The workspace may still ask which accounts its observer can use.
+    expect(container.querySelector('[data-testid="observer-config"]')).not.toBeNull()
+  })
+
+  it('keeps the spinner for any other workspace', async () => {
+    recordPrincipleStart({ ...START, id: 'other' })
+    mocks.opened = false
+    await act(async () => { root.render(<GadgetEditor />) })
+
+    expect(container.textContent).toContain('Loading workspace…')
+    expect(bubble()).toBeNull()
+  })
+
+  it('covers the conversation until it is ready, then lets the chat show and forgets the start', async () => {
+    recordPrincipleStart(START)
+    mocks.opened = false
+    mocks.chatsListed = false
+    await act(async () => { root.render(<GadgetEditor />) })
+    mocks.opened = true
+    await act(async () => { root.render(<GadgetEditor />) })
+
+    expect(container.textContent).toContain('chat pane')
+    expect(container.textContent).not.toContain('Loading conversation…')
+    expect(bubble()?.textContent).toBe(QUESTION)
+    expect(container.textContent).toContain('Thinking')
+    expect(principleStartFor('workspace')).toEqual(START)
+
+    await act(async () => mocks.listChats())
+    expect(bubble()).toBeNull()
+    expect(container.textContent).not.toContain('Thinking')
+    expect(principleStartFor('workspace')).toBeUndefined()
+    // The chat took its own copy as it mounted, and carries the start until its history loads.
+    expect(mocks.chatTook).toEqual(START)
+  })
+
+  it('shows the plain loading pages once the workspace has loaded', async () => {
+    recordPrincipleStart(START)
+    await act(async () => { root.render(<GadgetEditor />) })
+    expect(principleStartFor('workspace')).toBeUndefined()
+    // Even when its chats are listed at once, the chat mounts before the editor forgets the start.
+    expect(mocks.chatTook).toEqual(START)
+
+    mocks.opened = false
+    await act(async () => { root.render(<GadgetEditor />) })
+    expect(container.textContent).toContain('Loading workspace…')
+    expect(bubble()).toBeNull()
+  })
 })

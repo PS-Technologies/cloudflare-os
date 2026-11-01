@@ -17,6 +17,9 @@ vi.mock('../../AuthContext', () => ({
   useAuthenticatedApi: () => ({
     currentUser: { type: 'user', id: 'will@principlesvc.com', name: 'Will Grey' },
   }),
+  useOptionalAuthenticatedApi: () => ({
+    currentUser: { type: 'user', id: 'will@principlesvc.com', name: 'Will Grey' },
+  }),
 }))
 
 import AppShell from './AppShell'
