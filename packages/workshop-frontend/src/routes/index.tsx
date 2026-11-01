@@ -21,7 +21,8 @@ import {
   persistSelectedModel,
 } from "../modelSelection";
 import { useDocumentTitle } from "../useDocumentTitle";
-import { homeHandOff, homePromptFromSearch } from "../homePrompt";
+import { homePromptFromSearch } from "../homePrompt";
+import { useHomeHandOff } from "../useHomeHandOff";
 import { composerDraftStorageKey } from "../features/chat/composer/draft/composerDraft";
 
 type HomeSearch = {
@@ -60,7 +61,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
   // Bumped each time a task suggestion is picked; the composer re-seeds its text off the nonce.
   const [seed, setSeed] = useState<{ text: string; nonce: number } | null>(null);
   // Principle: a question the home page's Ask Watts handed over is sent, not typed (see below).
-  const [handOff] = useState(() => homeHandOff(prompt));
+  const handOff = useHomeHandOff(prompt);
   const handedOff = useRef(false);
   // Closes the composer while that question is on its way, so nothing else is sent or typed over it.
   const [handingOff, setHandingOff] = useState(handOff !== undefined);
@@ -140,7 +141,7 @@ export function HomePageContent({ prompt }: HomeSearch) {
         provisionalOverseerRef.current?.stub[Symbol.dispose]();
         provisionalOverseerRef.current = null;
         // Open the conversation we just started.
-        navigate({ to: "/workspace/$id", params: { id }, search: { chat } });
+        await navigate({ to: "/workspace/$id", params: { id }, search: { chat } });
       } catch (err) {
         const transient = logRpcFailure("Failed to create gadget:", err,
             { reportSite: "workspace.create" });
