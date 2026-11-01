@@ -131,6 +131,8 @@ import { UiBlockCard, type UiBlockCardProps } from "./features/chat/UiBlockCard"
 import { parseInlineHtmlBlocks } from "@gadgets/workshop-shared/inline-html-blocks";
 import { BlueprintProposalNotice } from "./features/blueprint-updates/BlueprintProposalNotice";
 import { appliedBlueprintMerges } from "./features/blueprint-updates/blueprintProposal";
+import { PrincipleStartMessages } from "./components/PrincipleStartFrame";
+import { usePrincipleStartHistory } from "./principleStart";
 
 /**
  * The selected chat's live (accepted but not yet materialized) change row stream, delivered via
@@ -2851,6 +2853,10 @@ function ChatInterface({
   const [chatListScope, setChatListScope] = useState<ChatListScope>("all");
   const [chatListVersion, setChatListVersion] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
+  // Principle: a chat home's Ask Watts started shows its question and Watts thinking until its
+  // history loads, carrying on from the editor's cover (principleStart.ts).
+  const principleStart = usePrincipleStartHistory(workspaceId, selectedChatId,
+    selectedChatId !== null && !isLoading && cacheRef.current.messages.has(selectedChatId));
   // Fetching the page before the selected chat's compaction boundary.
   const [isLoadingEarlier, setIsLoadingEarlier] = useState(false);
   const [updateCounter, setUpdateCounter] = useState(0); // Force re-render when cache updates
@@ -5871,7 +5877,9 @@ function ChatInterface({
                 onScroll={handleMessagesScroll}
                 className="chat-panel min-h-0 flex-1 overscroll-contain overflow-y-auto"
               >
-                {isLoading ? (
+                {principleStart !== undefined ? (
+                  <PrincipleStartMessages question={principleStart} />
+                ) : isLoading ? (
                   <div className="flex items-center justify-center py-10">
                     <div className="w-5 h-5 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
                   </div>
