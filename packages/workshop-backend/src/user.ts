@@ -2008,6 +2008,14 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.connectedAccounts.put(record);
   }
 
+  /** For GatekeeperConnectCallbackImpl#owner. */
+  async accountOwner(accountId: number): Promise<{ address: string; connected: boolean }> {
+    return {
+      address: this.storage.profile.get().id,
+      connected: this.storage.connectedAccounts.get(accountId) !== undefined,
+    };
+  }
+
   async markCredentialsExpired(accountId: number) {
     let record = this.storage.connectedAccounts.get(accountId);
     if (!record) throw new Error("No such account.");
@@ -2393,6 +2401,18 @@ export class GatekeeperConnectCallbackImpl
   async credentialsRestored(expiresAt?: Date): Promise<void> {
     let userStub = this.#getUserStub();
     await userStub.markCredentialsRestored(this.ctx.props.accountId, expiresAt);
+  }
+
+  /**
+   * The user this account is connected for, and whether it is one of their connected accounts now.
+   * `address` is their sign-in id, fixed for this callback's life: on a Cloudflare Access deployment,
+   * their verified email address. `connected` is false while a first connect waits for them to
+   * confirm it, and again once they disconnect it. Principle's Salesforce gatekeeper lists an account
+   * under `address` for the home page's search, and searches it only while `connected`.
+   * Not on `GatekeeperConnectCallback`, whose other implementation, the sign-in flow's, has no user.
+   */
+  owner(): Promise<{ address: string; connected: boolean }> {
+    return this.#getUserStub().accountOwner(this.ctx.props.accountId);
   }
 }
 
