@@ -409,4 +409,25 @@ describe("connect handoff", () => {
       expect(user.storage.nextAccountId.get()).toBe(1);
     });
   });
+
+  it("tells a connector whose account it is, and whether it is connected yet and still", async () => {
+    const { stub, inDo } = freshUser();
+    await stub.authenticateFromCfAccess("owner@example.com", true);
+    const callback = (user: UserInternals) => user.ctx.exports.TestConnectCallback({
+      props: { userId: user.ctx.id.toString(), accountId: 0, vendorId: "salesforce" },
+    });
+    const owner = () => inDo(user => callback(user).owner());
+    const handoff = await inDo(async user => {
+      user.storage.nextAccountId.put(1);
+      return callback(user).complete(fakeAccount(user, "owned", { failRevoke: true }).account);
+    });
+
+    // Staged until the person who started the flow confirms the browser that finished it.
+    expect(await owner()).toEqual({ address: "owner@example.com", connected: false });
+    await stub.completeConnectHandoff(handoff.ticket, await stub.openConnectFlow(0));
+    expect(await owner()).toEqual({ address: "owner@example.com", connected: true });
+    // Disconnected, though the connector failed to revoke its grant.
+    await stub.disconnectAccount(0);
+    expect(await owner()).toEqual({ address: "owner@example.com", connected: false });
+  });
 });
