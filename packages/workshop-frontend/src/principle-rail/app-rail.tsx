@@ -1,6 +1,7 @@
 import {
   BriefcaseIcon,
   ChatsCircleIcon,
+  GlobeSimpleIcon,
   HouseSimpleIcon,
   MoonIcon,
   MoonStarsIcon,
@@ -19,7 +20,7 @@ import { RAIL_BADGE } from './rail-badge.ts'
 // an app's own classes.
 
 /** A place the rail goes. */
-export type RailPlace = 'home' | 'dispatch' | 'agents' | 'proposal' | 'contracts' | 'apps'
+export type RailPlace = 'home' | 'dispatch' | 'agents' | 'proposal' | 'contracts' | 'apps' | 'sites'
 
 /** A theme the switch steps through: light, navy (`dark`) and charcoal. */
 export type RailTheme = 'light' | 'dark' | 'charcoal'
@@ -31,6 +32,7 @@ export type RailPerson = { email: string; name?: string | null }
 export const RAIL_LINKS: Readonly<Record<RailPlace, string>> = {
   home: 'https://home.principlesvc.app',
   apps: 'https://home.principlesvc.app/apps',
+  sites: 'https://home.principlesvc.app/sites',
   dispatch: 'https://dispatch.principlesvc.app',
   agents: 'https://agents.dispatch.principlesvc.app',
   proposal: 'https://proposals.principlesvc.app',
@@ -49,7 +51,7 @@ export type AppRailProps = {
   me?: RailPerson | null
   theme: RailTheme
   onTheme: (next: RailTheme) => void
-  /** Called on a plain click on a place. Return true to stay on the page instead; home switches Home and Apps in place. */
+  /** Called on a plain click on a place. Return true to stay on the page instead; home switches Home, Apps and Sites in place. */
   onNavigate?: (place: RailPlace) => boolean
   /** `column` stands at the page's left edge; `drawer` rides in an app's slide-out drawer on a narrow screen. */
   variant?: 'column' | 'drawer'
@@ -81,6 +83,7 @@ export function AppRail({ current, me, theme, onTheme, onNavigate, variant = 'co
       {place('proposal', 'Proposal', BriefcaseIcon, 'accent')}
       {place('contracts', 'Contracts', ScalesIcon, 'ok')}
       {place('apps', 'Apps', SquaresFourIcon)}
+      {place('sites', 'Sites', GlobeSimpleIcon)}
       <span className="ps-rail-fill" />
       <ThemeSwitch theme={theme} onTheme={onTheme} />
       <span title={me ? (me.name ?? me.email) : undefined} className="ps-rail-avatar">
