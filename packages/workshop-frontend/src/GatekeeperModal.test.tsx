@@ -6,7 +6,8 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
 import type {
-  AiChatAuthorInfo, AuthenticatedApi, ConnectedAccountsSubscriber, ConnectFlowStart, ModelKind,
+  AiChatAuthorInfo, AuthenticatedApi, ConnectedAccountsFilter, ConnectedAccountsSubscriber, ConnectFlowStart,
+  ModelKind,
 } from '@gadgets/workshop-shared/api'
 import type { SupportedResource } from '@gadgets/workshop-shared/gatekeeper'
 import { AuthPopupCancelledError } from './features/native-app/authPopup'
@@ -601,5 +602,145 @@ describe('GatekeeperModal resource grant step', () => {
     } finally {
       consoleError.mockRestore()
     }
+  })
+})
+
+describe('GatekeeperModal ambient vendors', () => {
+  // Like Principle's Files: each person's one account is minted, never signed in to, so the vendor
+  // has no connect flow. The backend leaves an account an admin turned on for everyone out of a
+  // subscription that does not ask for those accounts.
+  const STORE = { urlPattern: 'files://store', title: 'Work files', description: 'Files for this room' }
+  const FILES = { displayName: 'Files', url: 'https://files.example.com/', autoProvisionsAccount: true }
+  const FILES_ACCOUNT = { displayName: 'Files', avatar: { url: 'https://files.example.com/icon' } }
+
+  // `held` keeps the subscription from replaying until the test calls `replay()`, as the backend
+  // does while it is still minting the account it will replay.
+  function ambientApi({ forced, added, held = false }: { forced: boolean, added: boolean, held?: boolean }) {
+    let subscriber: ConnectedAccountsSubscriber | null = null
+    let includesForced = false
+    const replay = () => {
+      if (added && (!forced || includesForced)) {
+        subscriber!.add(3, FILES_ACCOUNT, FILES, [STORE], true, 'files')
+      }
+      subscriber!.ready()
+    }
+    const provisionAmbientAccount = vi.fn<(vendorId: string) => Promise<void>>(async () => {
+      subscriber!.add(3, FILES_ACCOUNT, FILES, [STORE], true, 'files')
+    })
+    const connectAccount = vi.fn<() => Promise<never>>(async () => {
+      throw new Error('Files is auto-provisioned and has no connect flow.')
+    })
+    api.startResourceConfigurator.mockImplementation(async () => ({
+      iframeHtml: '<!doctype html>',
+      ui: { [Symbol.dispose]() {} },
+    }))
+    testState.authenticatedApi = {
+      listModels: async () => [CHAT_MODEL],
+      listGatekeeperVendors: async () => [{ id: 'files', description: FILES, supportedResources: [STORE] }],
+      subscribeConnectedAccounts: (next: ConnectedAccountsSubscriber, filter?: ConnectedAccountsFilter) => {
+        subscriber = next
+        includesForced = filter?.includeForcedAutoProvisionedAccounts === true
+        if (!held) replay()
+        return subscription()
+      },
+      startResourceConfigurator: api.startResourceConfigurator,
+      provisionAmbientAccount,
+      connectAccount,
+    } as unknown as RpcStub<AuthenticatedApi>
+    return { provisionAmbientAccount, connectAccount, replay }
+  }
+
+  async function renderWorkFiles() {
+    stubResizeObserver()
+    container = document.createElement('div')
+    document.body.appendChild(container)
+    root = createRoot(container)
+    await act(async () => root!.render(<GatekeeperModal
+      open
+      onClose={() => {}}
+      getOverseer={() => { throw new Error('not called') }}
+      onCreated={() => Promise.resolve()}
+      initialVendorId="files"
+      initialResourceUrlPattern={STORE.urlPattern}
+    />))
+  }
+
+  const buttonLabels = () =>
+    Array.from(document.body.querySelectorAll('button'), button => button.textContent ?? '')
+
+  it.each([
+    { mode: 'on for everyone', forced: true },
+    { mode: 'added by the person', forced: false },
+  ])('opens Work files on the one Files account when it is $mode, offering no other', async ({ forced }) => {
+    ambientApi({ forced, added: true })
+    await renderWorkFiles()
+
+    await vi.waitFor(() => expect(api.startResourceConfigurator).toHaveBeenCalledWith(3, STORE.urlPattern))
+    expect(buttonLabels().filter(label => /Connect Files|Use another Files account/.test(label))).toEqual([])
+  })
+
+  it('adds the Files account rather than starting a sign-in it does not have', async () => {
+    const { provisionAmbientAccount, connectAccount } = ambientApi({ forced: false, added: false })
+    await renderWorkFiles()
+    const connect = await vi.waitFor(() => {
+      const button = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+        .find(candidate => candidate.textContent === 'Connect Files')
+      expect(button).toBeDefined()
+      return button!
+    })
+
+    await act(async () => connect.click())
+
+    expect(provisionAmbientAccount).toHaveBeenCalledExactlyOnceWith('files')
+    expect(connectAccount).not.toHaveBeenCalled()
+    expect(openConnectWindow).not.toHaveBeenCalled()
+    expect(testState.toasts).toEqual([])
+    await vi.waitFor(() => expect(api.startResourceConfigurator).toHaveBeenCalledWith(3, STORE.urlPattern))
+  })
+
+  // While the subscription has not called ready(), the backend may still be minting the account
+  // it is about to replay; a Connect pressed then would mint a second Files store.
+  const connectFiles = () => Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
+    .find(button => button.textContent === 'Connect Files')
+  const chooserShown = () => vi.waitFor(() =>
+    expect(document.body.textContent).toContain('Pick which Files identity'))
+
+  it('holds Connect Files until the accounts subscription is ready', async () => {
+    const { provisionAmbientAccount } = ambientApi({ forced: true, added: true, held: true })
+    await renderWorkFiles()
+    await chooserShown()
+
+    expect(connectFiles()?.disabled ?? true).toBe(true)
+    await act(async () => connectFiles()?.click())
+    expect(provisionAmbientAccount).not.toHaveBeenCalled()
+  })
+
+  it('offers no Connect once the subscription replays the Files account', async () => {
+    const { replay } = ambientApi({ forced: true, added: true, held: true })
+    await renderWorkFiles()
+    await chooserShown()
+
+    await act(async () => replay())
+
+    await vi.waitFor(() => expect(api.startResourceConfigurator).toHaveBeenCalledWith(3, STORE.urlPattern))
+    expect(buttonLabels().filter(label => /Connect Files|Use another Files account/.test(label))).toEqual([])
+  })
+
+  it('offers Connect once ready with no Files account, and adds it once', async () => {
+    // The automatic pass failed, so the subscription is ready with nothing to replay.
+    const { replay, provisionAmbientAccount, connectAccount } =
+      ambientApi({ forced: true, added: false, held: true })
+    await renderWorkFiles()
+    await chooserShown()
+
+    await act(async () => replay())
+    const connect = await vi.waitFor(() => {
+      expect(connectFiles()?.disabled).toBe(false)
+      return connectFiles()!
+    })
+    await act(async () => connect.click())
+
+    expect(provisionAmbientAccount).toHaveBeenCalledExactlyOnceWith('files')
+    expect(connectAccount).not.toHaveBeenCalled()
   })
 })
