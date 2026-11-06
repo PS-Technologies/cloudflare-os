@@ -40,6 +40,7 @@ import { useSiteName } from './ServerConfigContext'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
 import { useDialogSelectPortalContainer } from './useDialogSelectPortalContainer'
 import { openConnectWindow } from './connectHandoff'
+import { PICKER_ACCOUNTS, connectOrAddAccount } from './ambientAccounts'
 import { AuthPopupCancelledError } from './features/native-app/authPopup'
 
 export interface GatekeeperModalProps {
@@ -460,7 +461,7 @@ export default function GatekeeperModal({
         setAccounts(Array.from(accountMap.values()))
       },
     })
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
+    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber, PICKER_ACCOUNTS)
     subscription.catch(error => {
       if (cancelled) return
       logRpcFailure('Failed to subscribe to connected accounts:', error)
@@ -643,8 +644,9 @@ export default function GatekeeperModal({
   const handleConnectAccount = async (vendorId: string, resourceUrlPatterns?: string[]) => {
     setConnectingVendor(vendorId)
     try {
-      const outcome = await openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns), authenticatedApi)
-      toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
+      const outcome = await connectOrAddAccount(authenticatedApi, vendorId,
+        vendors.find(vendor => vendor.id === vendorId)?.description, resourceUrlPatterns)
+      if (outcome !== 'added') toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
     } catch (error) {
       if (error instanceof AuthPopupCancelledError) return
       console.error('Failed to initiate connection:', error)

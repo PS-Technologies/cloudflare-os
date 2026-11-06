@@ -9,6 +9,7 @@ import type {
   AiChatAuthorInfo,
   AuthenticatedApi,
   BlueprintPublicInfo,
+  ConnectedAccountsFilter,
   ConnectedAccountsSubscriber,
   ConnectFlowStart,
   ModelKind,
@@ -698,5 +699,107 @@ describe('BlueprintLandingPage configurator access requests', () => {
     expect(startResourceConfigurator).toHaveBeenLastCalledWith(2, RESOURCE.urlPattern)
     await ensureResources([IMPORT_GRANT])
     expect(ensureAccountResources).toHaveBeenCalledExactlyOnceWith(2, [IMPORT_GRANT])
+  })
+})
+
+describe('BlueprintLandingPage ambient connections', () => {
+  // Like Principle's Files: each person's one account is minted, never signed in to, so the vendor
+  // has no connect flow. The backend leaves an account an admin turned on for everyone out of a
+  // subscription that does not ask for those accounts.
+  const STORE: SupportedResource = { urlPattern: 'files://store', title: 'Work files', description: 'Files for this room' }
+  const FILES: VendorDescription = {
+    displayName: 'Files', url: 'https://files.example.com/', autoProvisionsAccount: true,
+  }
+  const FILES_ACCOUNT: AccountDescription = { displayName: 'Files', avatar: { url: 'https://files.example.com/icon' } }
+  const FILES_BLUEPRINT = {
+    ...BLUEPRINT,
+    metadata: {
+      ...BLUEPRINT.metadata,
+      title: 'Files blueprint',
+      description: 'Requires Work files.',
+      bindings: {
+        FILES: {
+          type: 'gatekeeper',
+          title: 'Work files',
+          description: '',
+          gatekeeperName: 'files',
+          typeUrlPattern: STORE.urlPattern,
+        },
+      },
+    },
+  } satisfies BlueprintPublicInfo
+
+  let root: Root | undefined
+  let rootContainer: HTMLDivElement | undefined
+
+  afterEach(() => {
+    act(() => root?.unmount())
+    rootContainer?.remove()
+    testState.authenticatedApi = null
+    testState.configuratorMounts = []
+    openConnectWindow.mockReset()
+  })
+
+  async function render({ forced, added }: { forced: boolean, added: boolean }) {
+    testState.configuratorMounts = []
+    let subscriber: ConnectedAccountsSubscriber | null = null
+    const provisionAmbientAccount = vi.fn<(vendorId: string) => Promise<void>>(async () => {
+      subscriber!.add(3, FILES_ACCOUNT, FILES, [STORE], true, 'files')
+    })
+    const connectAccount = vi.fn<() => Promise<never>>(async () => {
+      throw new Error('Files is auto-provisioned and has no connect flow.')
+    })
+    testState.authenticatedApi = {
+      ...(authenticatedApi() as object),
+      listGatekeeperVendors: async () => [{ id: 'files', description: FILES, supportedResources: [STORE] }],
+      subscribeConnectedAccounts: (next: ConnectedAccountsSubscriber, filter?: ConnectedAccountsFilter) => {
+        subscriber = next
+        if (added && (!forced || filter?.includeForcedAutoProvisionedAccounts)) {
+          next.add(3, FILES_ACCOUNT, FILES, [STORE], true, 'files')
+        }
+        next.ready()
+        return subscription()
+      },
+      startResourceConfigurator: async () => ({
+        iframeHtml: '<!doctype html>',
+        ui: { [Symbol.dispose]() {} } as ResourceConfiguratorFrame['ui'],
+      }),
+      provisionAmbientAccount,
+      connectAccount,
+    } as unknown as RpcStub<AuthenticatedApi>
+    rootContainer = document.createElement('div')
+    document.body.appendChild(rootContainer)
+    root = createRoot(rootContainer)
+    await act(async () => root!.render(<BlueprintLandingPage rpcStub={publicApi(FILES_BLUEPRINT)} />))
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+    await act(async () => findButton('Configure')!.click())
+    return { provisionAmbientAccount, connectAccount }
+  }
+
+  const buttonLabels = () =>
+    Array.from(document.body.querySelectorAll('button'), button => button.textContent ?? '')
+
+  it.each([
+    { mode: 'on for everyone', forced: true },
+    { mode: 'added by the person', forced: false },
+  ])('configures Work files on the one Files account when it is $mode, offering no other', async ({ forced }) => {
+    await render({ forced, added: true })
+
+    await vi.waitFor(() => expect(testState.configuratorMounts).toEqual([{
+      initialResourceUrl: undefined,
+      resourceUrlPattern: STORE.urlPattern,
+    }]))
+    expect(buttonLabels().filter(label => /Connect Files|Use another Files account/.test(label))).toEqual([])
+  })
+
+  it('adds the Files account rather than starting a sign-in it does not have', async () => {
+    const { provisionAmbientAccount, connectAccount } = await render({ forced: false, added: false })
+
+    await act(async () => findButton('Connect Files')!.click())
+
+    expect(provisionAmbientAccount).toHaveBeenCalledExactlyOnceWith('files')
+    expect(connectAccount).not.toHaveBeenCalled()
+    expect(openConnectWindow).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(testState.configuratorMounts).toHaveLength(1))
   })
 })

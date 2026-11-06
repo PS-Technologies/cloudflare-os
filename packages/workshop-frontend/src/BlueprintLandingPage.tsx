@@ -24,6 +24,7 @@ import { useDocumentTitle } from './useDocumentTitle'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
 import { useDialogSelectPortalContainer } from './useDialogSelectPortalContainer'
 import { openConnectWindow } from './connectHandoff'
+import { PICKER_ACCOUNTS, connectOrAddAccount } from './ambientAccounts'
 import { requestAccountResources } from './requestAccountResources'
 import { AuthPopupCancelledError } from './features/native-app/authPopup'
 
@@ -227,7 +228,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
       },
     })
 
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
+    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber, PICKER_ACCOUNTS)
     subscription.catch(err => {
       if (cancelled) return
       logRpcFailure('Failed to subscribe to connected accounts:', err)
@@ -243,9 +244,9 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
     if (!authenticatedApi) return
     setConnectingVendor(vendorId)
     try {
-      const outcome = await openConnectWindow(
-        await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns), authenticatedApi)
-      toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
+      const outcome = await connectOrAddAccount(authenticatedApi, vendorId,
+        vendors.find(vendor => vendor.id === vendorId)?.description, resourceUrlPatterns)
+      if (outcome !== 'added') toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
     } catch (err) {
       if (err instanceof AuthPopupCancelledError) return
       console.error('Failed to initiate connection:', err)
@@ -253,7 +254,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
     } finally {
       setConnectingVendor(null)
     }
-  }, [authenticatedApi, toasts])
+  }, [authenticatedApi, toasts, vendors])
 
   const handleGrantAccountResources = useCallback(async (
     accountId: number,

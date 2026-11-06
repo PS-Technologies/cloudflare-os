@@ -12,6 +12,7 @@ import {
 } from './components/pickerRows'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
 import { openConnectWindow } from './connectHandoff'
+import { PICKER_ACCOUNTS, connectOrAddAccount, offersAnotherAccount } from './ambientAccounts'
 import { AuthPopupCancelledError } from './features/native-app/authPopup'
 
 export interface VendorOption {
@@ -145,7 +146,7 @@ export default function ResourcePicker({
         setAccountsLoaded(true)
       },
     })
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
+    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber, PICKER_ACCOUNTS)
     subscription.catch(error => {
       if (cancelled) return
       logRpcFailure('Failed to subscribe to connected accounts:', error)
@@ -329,8 +330,9 @@ export default function ResourcePicker({
         })
       }
 
-      // "Connect new account" row (not shown in accountsOnly mode).
-      if (!accountsOnly) {
+      // "Connect new account" row (not shown in accountsOnly mode, nor once an ambient vendor has
+      // its one account).
+      if (!accountsOnly && offersAnotherAccount(vendor.description, vendorAccounts.length)) {
         items.push({
           type: 'connect',
           vendorId: vendor.id,
@@ -395,7 +397,8 @@ export default function ResourcePicker({
   const handleConnectNew = async (vendorId: string, resourceUrlPatterns?: string[]) => {
     setConnectingVendor(vendorId)
     try {
-      await openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns), authenticatedApi)
+      await connectOrAddAccount(authenticatedApi, vendorId,
+        allVendors.find(vendor => vendor.id === vendorId)?.description, resourceUrlPatterns)
     } catch (error) {
       if (error instanceof AuthPopupCancelledError) return
       console.error('Failed to initiate connection:', error)
@@ -591,7 +594,7 @@ export default function ResourcePicker({
 
                 {/* Connect new account */}
                 {(() => {
-                  if (accountsOnly) return null
+                  if (accountsOnly || !offersAnotherAccount(vendor.description, vendorAccounts.length)) return null
                   const isActive = itemIdx === activeIndex
                   itemIdx++
                   return (
