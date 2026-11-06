@@ -5,7 +5,9 @@ import { act, type ComponentProps } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
-import type { AuthenticatedApi, ConnectedAccountsSubscriber, GatekeeperVendorInfo } from '@gadgets/workshop-shared/api'
+import type {
+  AuthenticatedApi, ConnectedAccountsFilter, ConnectedAccountsSubscriber, GatekeeperVendorInfo,
+} from '@gadgets/workshop-shared/api'
 import type { AccountDescription, SupportedResource } from '@gadgets/workshop-shared/gatekeeper'
 import ResourcePicker from './ResourcePicker'
 
@@ -175,5 +177,116 @@ describe('ResourcePicker', () => {
 
     expect(text.indexOf('GitLab Merge Request')).toBeGreaterThanOrEqual(0)
     expect(text.indexOf('GitLab Merge Request')).toBeLessThan(text.indexOf('GitLab Project'))
+  })
+
+  describe('ambient vendors', () => {
+    // Like Principle's Website: each person's one account is minted, never signed in to. The
+    // backend leaves an account an admin turned on for everyone out of a subscription that does not
+    // ask for those accounts.
+    const SITE: SupportedResource = { urlPattern: 'https://*.*/*', title: 'Website', description: 'One hostname' }
+    const vendor = {
+      id: 'site',
+      description: { displayName: 'Website', url: 'https://site.example.com/', autoProvisionsAccount: true },
+      supportedResources: [SITE],
+    }
+    const ACCOUNT = { displayName: 'Website', avatar: { url: '' } }
+
+    // `held` keeps the subscription from replaying until the test calls `replay()`, as the backend
+    // does while it is still minting the account it will replay.
+    const renderAmbient = async ({ forced, added, held = false }: { forced: boolean, added: boolean, held?: boolean }) => {
+      let subscriber: ConnectedAccountsSubscriber | null = null
+      let includesForced = false
+      const replay = () => {
+        if (added && (!forced || includesForced)) {
+          subscriber!.add(4, ACCOUNT, vendor.description, [SITE], true, 'site')
+        }
+        subscriber!.ready()
+      }
+      const provisionAmbientAccount = vi.fn<(vendorId: string) => Promise<void>>(async () => {
+        subscriber!.add(4, ACCOUNT, vendor.description, [SITE], true, 'site')
+      })
+      const connectAccount = vi.fn<() => Promise<never>>(async () => {
+        throw new Error('Website has no connect flow.')
+      })
+      const onSelectAccount = vi.fn<(accountId: number) => void>()
+      const authenticatedApi = {
+        subscribeConnectedAccounts: (next: ConnectedAccountsSubscriber, filter?: ConnectedAccountsFilter) => {
+          subscriber = next
+          includesForced = filter?.includeForcedAutoProvisionedAccounts === true
+          if (!held) replay()
+          return Object.assign(Promise.resolve(), { [Symbol.dispose]: () => {} })
+        },
+        listGatekeeperVendors: async () => [vendor],
+        provisionAmbientAccount,
+        connectAccount,
+      } as unknown as RpcStub<AuthenticatedApi>
+      container = document.createElement('div')
+      document.body.append(container)
+      root = createRoot(container)
+      await act(async () => root!.render(
+        <ResourcePicker
+          authenticatedApi={authenticatedApi}
+          searchText="https://docs.example.com/guide"
+          onSelectAccount={onSelectAccount}
+        />,
+      ))
+      return { picker: container, provisionAmbientAccount, connectAccount, onSelectAccount, replay }
+    }
+
+    // The last match is the row's own label: the resource heading above it also reads "Website".
+    const row = (picker: HTMLElement, label: string) =>
+      [...picker.querySelectorAll<HTMLElement>('span')].findLast(span => span.textContent === label)
+
+    it.each([
+      { mode: 'on for everyone', forced: true },
+      { mode: 'added by the person', forced: false },
+    ])('offers the one Website account when it is $mode, and no other', async ({ forced }) => {
+      const { picker, onSelectAccount } = await renderAmbient({ forced, added: true })
+
+      expect(picker.textContent).not.toContain('Connect new account')
+      act(() => row(picker, 'Website')!.click())
+      expect(onSelectAccount).toHaveBeenCalledWith(4, 'site', SITE, ACCOUNT, vendor.description)
+    })
+
+    it('adds the Website account rather than starting a sign-in it does not have', async () => {
+      const { picker, provisionAmbientAccount, connectAccount } = await renderAmbient({ forced: false, added: false })
+
+      await act(async () => row(picker, 'Connect new account')!.click())
+
+      expect(provisionAmbientAccount).toHaveBeenCalledExactlyOnceWith('site')
+      expect(connectAccount).not.toHaveBeenCalled()
+      expect(picker.textContent).not.toContain('Connect new account')
+    })
+
+    // While the subscription has not called ready(), the backend may still be minting the account
+    // it is about to replay; a Connect pressed then would mint a second.
+    it('holds Connect until the accounts subscription is ready', async () => {
+      const { picker } = await renderAmbient({ forced: true, added: true, held: true })
+
+      expect(picker.textContent).toContain('Loading connections…')
+      expect(picker.textContent).not.toContain('Connect new account')
+    })
+
+    it('offers no Connect once the subscription replays the Website account', async () => {
+      const { picker, replay, onSelectAccount } = await renderAmbient({ forced: true, added: true, held: true })
+
+      await act(async () => replay())
+
+      expect(picker.textContent).not.toContain('Connect new account')
+      act(() => row(picker, 'Website')!.click())
+      expect(onSelectAccount).toHaveBeenCalledWith(4, 'site', SITE, ACCOUNT, vendor.description)
+    })
+
+    it('offers Connect once ready with no Website account, and adds it once', async () => {
+      // The automatic pass failed, so the subscription is ready with nothing to replay.
+      const { picker, replay, provisionAmbientAccount, connectAccount } =
+        await renderAmbient({ forced: true, added: false, held: true })
+
+      await act(async () => replay())
+      await act(async () => row(picker, 'Connect new account')!.click())
+
+      expect(provisionAmbientAccount).toHaveBeenCalledExactlyOnceWith('site')
+      expect(connectAccount).not.toHaveBeenCalled()
+    })
   })
 })
