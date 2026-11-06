@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Check, Plus, UserCircle } from '@phosphor-icons/react'
 import { AccountDescription, SupportedResource, VendorDescription } from '@gadgets/workshop-shared/gatekeeper'
+import { offersAnotherAccount } from '../ambientAccounts'
 
 /**
  * Account info as consumed by the chooser. Matches the shape used by GatekeeperModal and the
@@ -142,7 +143,8 @@ export function AccountChooser({
           )
         })}
 
-        {(!isEmailMailbox || accounts.length === 0) && (
+        {(!isEmailMailbox || accounts.length === 0) &&
+          offersAnotherAccount(accounts[0]?.vendorDescription, accounts.length) && (
           <button
             type="button"
             onClick={onConnect}
