@@ -41,6 +41,7 @@ import { useSiteName } from './ServerConfigContext'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
 import { useDialogSelectPortalContainer } from './useDialogSelectPortalContainer'
 import { openConnectWindow } from './connectHandoff'
+import { PICKER_ACCOUNTS, connectOrAddAccount, holdsConnect } from './ambientAccounts'
 import { AuthPopupCancelledError } from './features/native-app/authPopup'
 
 export interface GatekeeperModalProps {
@@ -239,6 +240,8 @@ export default function GatekeeperModal({
   const [grantingAccountId, setGrantingAccountId] = useState<number | null>(null)
   const [reconnectingAccountId, setReconnectingAccountId] = useState<number | null>(null)
   const [accounts, setAccounts] = useState<AccountOption[]>([])
+  // The subscription replays the accounts it already has before calling `ready()`.
+  const [accountsReady, setAccountsReady] = useState(false)
   const [vendors, setVendors] = useState<VendorOption[]>([])
 
   const [availableModels, setAvailableModels] = useState<AiChatAuthorInfo[]>([])
@@ -465,15 +468,22 @@ export default function GatekeeperModal({
         accountMap.delete(id)
         setAccounts(Array.from(accountMap.values()))
       },
+      ready() {
+        if (cancelled) return
+        setAccountsReady(true)
+      },
     })
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
+    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber, PICKER_ACCOUNTS)
     subscription.catch(error => {
       if (cancelled) return
       logRpcFailure('Failed to subscribe to connected accounts:', error)
+      // Nothing more is coming, so stop holding Connect for it.
+      setAccountsReady(true)
     })
 
     return () => {
       cancelled = true
+      setAccountsReady(false)
       subscription[Symbol.dispose]()
     }
   }, [open, authenticatedApi])
@@ -659,8 +669,9 @@ export default function GatekeeperModal({
   const handleConnectAccount = async (vendorId: string, resourceUrlPatterns?: string[]) => {
     setConnectingVendor(vendorId)
     try {
-      const outcome = await openConnectWindow(await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns), authenticatedApi)
-      toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
+      const outcome = await connectOrAddAccount(authenticatedApi, vendorId,
+        vendors.find(vendor => vendor.id === vendorId)?.description, resourceUrlPatterns)
+      if (outcome !== 'added') toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
     } catch (error) {
       if (error instanceof AuthPopupCancelledError) return
       console.error('Failed to initiate connection:', error)
@@ -886,7 +897,8 @@ export default function GatekeeperModal({
                     vendorId={selectedConnection.vendorId}
                     vendorName={selectedConnection.vendor}
                     resourceTitle={selectedConnection.resourceUrlPattern ? selectedConnection.title : undefined}
-                    connecting={connectingVendor === selectedConnection.vendorId}
+                    connecting={connectingVendor === selectedConnection.vendorId || holdsConnect(
+                      vendors.find(vendor => vendor.id === selectedConnection.vendorId)?.description, accountsReady)}
                     reconnectingAccountId={reconnectingAccountId}
                     requiredResourceUrlPatterns={account => requiredResourceUrlPatterns(selectedConnection, account)}
                     grantingAccountId={grantingAccountId}

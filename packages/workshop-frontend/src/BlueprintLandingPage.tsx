@@ -24,6 +24,7 @@ import { useDocumentTitle } from './useDocumentTitle'
 import { AccountsSubscriberAdapter } from './accountsSubscriber'
 import { useDialogSelectPortalContainer } from './useDialogSelectPortalContainer'
 import { openConnectWindow } from './connectHandoff'
+import { PICKER_ACCOUNTS, connectOrAddAccount, holdsConnect } from './ambientAccounts'
 import { requestAccountResources } from './requestAccountResources'
 import { AuthPopupCancelledError } from './features/native-app/authPopup'
 
@@ -79,6 +80,8 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
   // Vendor catalog + connected accounts, shared by all gatekeeper bindings during configure.
   const [vendors, setVendors] = useState<{id: string, description: VendorDescription, supportedResources: SupportedResource[]}[]>([])
   const [accounts, setAccounts] = useState<AccountOption[]>([])
+  // Whether the subscription has called `ready()`, so `accounts` holds every account it had.
+  const [accountsReady, setAccountsReady] = useState(false)
   const accountsRef = useRef<Map<number, AccountOption>>(new Map())
   const [connectingVendor, setConnectingVendor] = useState<string | null>(null)
   const [grantingAccountId, setGrantingAccountId] = useState<number | null>(null)
@@ -224,17 +227,21 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
         if (cancelled) return
         replayed = true
         publish()
+        setAccountsReady(true)
       },
     })
 
-    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber)
+    const subscription = authenticatedApi.subscribeConnectedAccounts(subscriber, PICKER_ACCOUNTS)
     subscription.catch(err => {
       if (cancelled) return
       logRpcFailure('Failed to subscribe to connected accounts:', err)
+      // Nothing more is coming, so stop holding Connect for it.
+      setAccountsReady(true)
     })
 
     return () => {
       cancelled = true
+      setAccountsReady(false)
       subscription[Symbol.dispose]()
     }
   }, [isAuthenticated, authenticatedApi])
@@ -243,9 +250,9 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
     if (!authenticatedApi) return
     setConnectingVendor(vendorId)
     try {
-      const outcome = await openConnectWindow(
-        await authenticatedApi.connectAccount(vendorId, resourceUrlPatterns), authenticatedApi)
-      toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
+      const outcome = await connectOrAddAccount(authenticatedApi, vendorId,
+        vendors.find(vendor => vendor.id === vendorId)?.description, resourceUrlPatterns)
+      if (outcome !== 'added') toasts.add({ title: outcome === 'connected' ? 'Account connected.' : 'Complete the account connection in the pop-up window.', variant: 'success' })
     } catch (err) {
       if (err instanceof AuthPopupCancelledError) return
       console.error('Failed to initiate connection:', err)
@@ -253,7 +260,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
     } finally {
       setConnectingVendor(null)
     }
-  }, [authenticatedApi, toasts])
+  }, [authenticatedApi, toasts, vendors])
 
   const handleGrantAccountResources = useCallback(async (
     accountId: number,
@@ -1095,6 +1102,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
                   authenticatedApi={authenticatedApi}
                   vendors={vendors}
                   accounts={accounts}
+                  accountsReady={accountsReady}
                   connectingVendor={connectingVendor}
                   grantingAccountId={grantingAccountId}
                   reconnectingAccountId={reconnectingAccountId}
@@ -1394,6 +1402,7 @@ function BindingField({
   authenticatedApi,
   vendors,
   accounts,
+  accountsReady,
   connectingVendor,
   grantingAccountId,
   reconnectingAccountId,
@@ -1412,6 +1421,7 @@ function BindingField({
   authenticatedApi: RpcStub<AuthenticatedApi>
   vendors: {id: string, description: VendorDescription, supportedResources: SupportedResource[]}[]
   accounts: AccountOption[]
+  accountsReady: boolean
   connectingVendor: string | null
   grantingAccountId: number | null
   reconnectingAccountId: number | null
@@ -1434,6 +1444,7 @@ function BindingField({
         authenticatedApi={authenticatedApi}
         vendors={vendors}
         accounts={accounts}
+        accountsReady={accountsReady}
         connectingVendor={connectingVendor}
         grantingAccountId={grantingAccountId}
         reconnectingAccountId={reconnectingAccountId}
@@ -1579,6 +1590,7 @@ function BlueprintGatekeeperBindingField({
   authenticatedApi,
   vendors,
   accounts,
+  accountsReady,
   connectingVendor,
   grantingAccountId,
   reconnectingAccountId,
@@ -1595,6 +1607,7 @@ function BlueprintGatekeeperBindingField({
   authenticatedApi: RpcStub<AuthenticatedApi>
   vendors: {id: string, description: VendorDescription, supportedResources: SupportedResource[]}[]
   accounts: AccountOption[]
+  accountsReady: boolean
   connectingVendor: string | null
   grantingAccountId: number | null
   reconnectingAccountId: number | null
@@ -1774,7 +1787,7 @@ function BlueprintGatekeeperBindingField({
         vendorId={vendor.id}
         vendorName={vendor.description.displayName}
         resourceTitle={resource.title}
-        connecting={connectingVendor === vendor.id}
+        connecting={connectingVendor === vendor.id || holdsConnect(vendor.description, accountsReady)}
         reconnectingAccountId={reconnectingAccountId}
         requiredResourceUrlPatterns={requiredResourceUrlPatterns}
         grantingAccountId={grantingAccountId}
