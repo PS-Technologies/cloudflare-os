@@ -17,7 +17,8 @@
     "@gadgets/observability": "workspace:*",
     "@gadgets/workshop-shared": "workspace:*",
     "capnweb": "catalog:",
-    "capnweb-validate": "catalog:"
+    "capnweb-validate": "catalog:",
+    "pako": "^3.0.2"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "catalog:",
