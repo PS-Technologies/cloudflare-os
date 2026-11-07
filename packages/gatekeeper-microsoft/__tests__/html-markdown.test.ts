@@ -30,12 +30,25 @@ describe("htmlToMarkdown", () => {
 
   it("writes a table with a header row, escaping pipes in cells once", () => {
     expect(htmlToMarkdown("<table><tr><th>Name</th><th>Role</th></tr><tr><td>Sarah</td><td>Eng | Lead</td></tr><tr><td>Bob<br>Smith</td></tr></table>"))
-      .toBe("| Name | Role |\n| --- | --- |\n| Sarah | Eng \\| Lead |\n| Bob Smith |  |");
+      .toBe("| Name | Role |\n| --- | --- |\n| Sarah | Eng \\| Lead |\n| Bob Smith |");
+  });
+
+  it("writes a table in size linear in its cells: a short row is left short, as GitHub fills it", () => {
+    const wide = `<table><tr>${"<th>x</th>".repeat(2_000)}</tr>${"<tr><td>x</td></tr>".repeat(1_999)}</table>`;
+    expect(htmlToMarkdown(wide).length).toBeLessThan(40_000);
+    const long = `<table>${"<tr><td>x</td></tr>".repeat(1_999)}<tr>${"<td>x</td>".repeat(2_000)}</tr></table>`;
+    expect(htmlToMarkdown(long).length).toBeLessThan(40_000);
   });
 
   it("keeps an outer table's rows around a nested table, whose text joins the cell", () => {
     expect(htmlToMarkdown("<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td><table><tr><td>x</td><td>y</td></tr></table></td></tr><tr><td>2</td><td>z</td></tr></table>"))
       .toBe("| A | B |\n| --- | --- |\n| 1 | x y |\n| 2 | z |");
+  });
+
+  it("writes a table with more rows than a function call takes arguments", () => {
+    const rows = htmlToMarkdown(`<table><tr><th>A</th></tr>${"<tr><td>1</td></tr>".repeat(200_000)}</table>`).split("\n");
+    expect(rows).toHaveLength(200_002);
+    expect(rows.slice(0, 3)).toEqual(["| A |", "| --- |", "| 1 |"]);
   });
 
   it("gives a table without a header an empty one, as GitHub requires", () => {
@@ -64,6 +77,15 @@ describe("htmlToMarkdown", () => {
     expect(htmlToMarkdown("<p>a</p><script>never closed")).toBe("a");
   });
 
+  it("drops a text's leading space after a space already written, across tags, headings, list markers, line breaks and cells", () => {
+    expect(htmlToMarkdown("<h2> Head <b> bold </b></h2><p>a <b>b</b> c<i> d</i>e <a href=\"https://a.com/\">link</a> f</p>"))
+      .toBe("## Head ** bold **\n\na **b** c_ d_e [link](https://a.com/) f");
+    expect(htmlToMarkdown("<ul><li> one <b>two</b></li><li> three</li></ul><p>x<br> y <br>z</p>")).toBe("- one **two**\n- three\n\nx\ny\nz");
+    expect(htmlToMarkdown("<table><tr><th> H1 </th><th>H2</th></tr><tr><td> x <b>y</b><br> z</td><td> w</td></tr></table> after"))
+      .toBe("| H1 | H2 |\n| --- | --- |\n| x **y** z | w |\n\nafter");
+    expect(htmlToMarkdown("<pre> keep  <b>this</b>\n x</pre> tail <b> </b> end")).toBe("```\n keep  **this**\n x\n```\n\ntail ** ** end");
+  });
+
   it("keeps a stray < as text", () => {
     expect(htmlToMarkdown("<p>1 < 2 and 3 <> 4</p>")).toBe("1 \\< 2 and 3 \\<\\> 4");
   });
@@ -75,7 +97,7 @@ describe("htmlToMarkdown", () => {
 
 describe("decodeEntities", () => {
   it("decodes named, decimal and hex references, keeping unknown names", () => {
-    expect(decodeEntities("&lt;&GT;&#65;&#x42;&nbsp;&unknown;")).toBe("<>AB &unknown;");
+    expect(decodeEntities("&lt;&GT;&#65;&#x42;&nbsp;&unknown;")).toBe("<>AB\u00a0&unknown;");
   });
 
   it("replaces NUL, lone surrogates and out-of-range code points", () => {
