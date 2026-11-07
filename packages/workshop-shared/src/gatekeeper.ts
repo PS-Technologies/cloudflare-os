@@ -978,8 +978,8 @@ export interface GitPullTransfer extends RpcTarget {
  * on every person-driven path (agent turn, gadget UI, direct binding use) and omits it for
  * headless callers.
  *
- * Identity is conveyed only via `verifier`, which the overseer returns only to the vendor that
- * minted it. `observerId` is the opaque handle from `addObserver` when the person is a stored
+ * Identity is conveyed via `verifier`, which the overseer returns only to the vendor that
+ * minted it, except for the Browser Run notice identity fields below. `observerId` is the opaque handle from `addObserver` when the person is a stored
  * collaborator; owners have none. `verifier` is absent when the person is named but the account
  * they chose for this binding is gone — gatekeepers that execute per-user should then refuse
  * rather than fall back to the binding's creator.
@@ -987,6 +987,10 @@ export interface GitPullTransfer extends RpcTarget {
 export type GatekeeperSessionActor = {
   observerId?: string;
   verifier?: Fetcher<GatekeeperUserVerifier>;
+  /** Browser Run only: the requesting person's sign-in id, for their handoff notice; no authority. */
+  profileId?: string;
+  /** Browser Run only: the waiting gateway message key, `<source>:<messageKey>`, if this turn answers it. */
+  externalMessageKey?: string;
 };
 
 /**
