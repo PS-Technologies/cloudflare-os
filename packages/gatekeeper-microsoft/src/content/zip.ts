@@ -5,6 +5,7 @@
 // inflated once and kept, so the bound is on the archive's content rather than on how often a
 // converter reads a part.
 
+import { Inflate } from "pako";
 import { decodeText } from "./text";
 
 /** Why an archive was refused. */
@@ -89,12 +90,6 @@ const FLAG_ENCRYPTED_DIRECTORY = 1 << 13;
 
 const METHOD_STORED = 0;
 const METHOD_DEFLATED = 8;
-
-/**
- * Compressed bytes handed to the inflater per write. Deflate expands at most about 1032:1, so this
- * bounds how far one write can overshoot a limit before the reader sees the output and stops.
- */
-const INFLATE_INPUT_CHUNK = 4 * 1024;
 
 /** Parses the archive's directory. Entry contents are inflated only when read. */
 export function openZip(bytes: Uint8Array, limits: Partial<ZipLimits> = {}): ZipArchive {
@@ -236,7 +231,7 @@ class Archive implements ZipArchive {
     if (entry.declaredSize > limit) throw this.#limitError(entry, limit);
 
     const data = this.#entryData(entry);
-    const content = await this.#decompress(entry, data, limit);
+    const content = this.#decompress(entry, data, limit);
     if (content.length !== entry.declaredSize) {
       throw new ZipError("malformed", `Entry "${entry.name}" is ${content.length} bytes, not the ${entry.declaredSize} it declares`);
     }
@@ -261,14 +256,14 @@ class Archive implements ZipArchive {
     return this.bytes.subarray(start, end);
   }
 
-  async #decompress(entry: DirectoryEntry, data: Uint8Array, limit: number): Promise<Uint8Array> {
+  #decompress(entry: DirectoryEntry, data: Uint8Array, limit: number): Uint8Array {
     switch (entry.method) {
       case METHOD_STORED:
         if (data.length > limit) throw this.#limitError(entry, limit);
         this.#inflatedSoFar += data.length;
         return data.slice();
       case METHOD_DEFLATED: {
-        const content = await inflateRaw(data, limit, () => this.#limitError(entry, limit), entry.name);
+        const content = inflateRaw(data, limit, () => this.#limitError(entry, limit), entry.name);
         this.#inflatedSoFar += content.length;
         return content;
       }
@@ -285,44 +280,39 @@ class Archive implements ZipArchive {
 }
 
 /**
- * Inflates raw deflate data, stopping as soon as the output passes `limit`. Input is fed in small
- * chunks under the stream's backpressure so a bomb is caught after one chunk's worth of output,
- * not after the runtime has inflated the whole entry into memory.
+ * Inflates raw deflate data, stopping as soon as the output passes `limit`. pako hands over its
+ * output a chunk (64 KiB at most) at a time and the count stops it at the first chunk past the
+ * limit, so a bomb costs the limit plus one chunk. workerd's DecompressionStream can't be stopped
+ * that way: it applies no backpressure, inflating everything written to it whether or not its
+ * output is read. A stream that is cut short, damaged or followed by more bytes is refused, as
+ * the platform's inflater refuses it.
  */
-async function inflateRaw(data: Uint8Array, limit: number, limitError: () => ZipError, name: string): Promise<Uint8Array> {
-  const inflater = new DecompressionStream("deflate-raw");
-  const writer = inflater.writable.getWriter();
-  const reader = inflater.readable.getReader();
-  const writing = feed(writer, data);
-  writing.catch(() => { /* surfaced through the reader */ });
-
+function inflateRaw(data: Uint8Array, limit: number, limitError: () => ZipError, name: string): Uint8Array {
+  const inflater = new Inflate({ raw: true }) as unknown as InflateWithInternals;
   const chunks: Uint8Array[] = [];
   let total = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.length;
-      if (total > limit) {
-        await reader.cancel().catch(() => {});
-        throw limitError();
-      }
-      chunks.push(value);
-    }
-    await writing;
-  } catch (error) {
-    if (error instanceof ZipError) throw error;
-    throw new ZipError("malformed", `Entry "${name}" is not valid deflate data`, { cause: error });
+  inflater.onData = chunk => {
+    total += chunk.length;
+    // pako offers no abort; raising here unwinds through push() below.
+    if (total > limit) throw limitError();
+    chunks.push(chunk);
+  };
+  inflater.push(data, true);
+  if (inflater.err !== 0 || !inflater.ended || inflater.strm.avail_in > 0) {
+    throw new ZipError("malformed", `Entry "${name}" is not valid deflate data${inflater.msg ? ` (${inflater.msg})` : ""}`);
   }
   return concat(chunks, total);
 }
 
-async function feed(writer: WritableStreamDefaultWriter<BufferSource>, data: Uint8Array): Promise<void> {
-  for (let at = 0; at < data.length; at += INFLATE_INPUT_CHUNK) {
-    await writer.ready;
-    await writer.write(data.subarray(at, at + INFLATE_INPUT_CHUNK));
-  }
-  await writer.close();
+// pako's Inflate as this reader uses it: `strm.avail_in`, which pako's declarations keep private,
+// is how many input bytes the stream left unread once it ended.
+interface InflateWithInternals {
+  ended: boolean;
+  err: number;
+  msg: string;
+  strm: { avail_in: number };
+  onData: (chunk: Uint8Array) => void;
+  push(data: Uint8Array, flush: boolean): boolean;
 }
 
 /** The chunks as one array; `total` is their combined length when the caller already has it. */
