@@ -4,6 +4,7 @@
 // second even when the input is hostile.
 
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { docxToMarkdown } from "../../src/content/docx";
 import { docxFeatures } from "../../src/content/docx-features";
@@ -18,10 +19,11 @@ import { parseXml, XmlError } from "../../src/content/xml";
 import { writeZip } from "../../src/content/zip-write";
 import { htmlToMarkdown } from "../../src/html-markdown";
 import { featuresLost } from "../../src/office-write";
-import { mailToMarkdown } from "../../src/outlook-content";
+import { MAX_MAIL_HTML_CHARS, mailToMarkdown } from "../../src/outlook-content";
+import { pageMarkdown } from "../../src/sharepoint-content";
 import { buildDocx, buildPptx, paragraph, run, shape, slideParagraph } from "./test-fixtures";
 
-const fixture = (name: string) => new Uint8Array(readFileSync(new URL(`../fixtures/${name}`, import.meta.url).pathname));
+const fixture = (name: string) => new Uint8Array(readFileSync(fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url).href)));
 const DECK = fixture("python-pptx-deck.pptx");
 const P = 'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
 
@@ -144,5 +146,179 @@ describe("pathological text", () => {
     expect((await timed(() => mailToMarkdown(styled, { maxChars: 50_000 }))).result?.markdown).toBe("Hi");
     const text = { contentType: "text" as const, content: `x${spaces}${spaces}y` };
     expect((await timed(() => mailToMarkdown(text, { maxChars: 500_000 }))).result?.markdown).toBe(`x${spaces}${spaces}y`);
+  });
+
+  const mail = (content: string) => mailToMarkdown({ contentType: "html", content }, { maxChars: 50_000 });
+
+  it("mailToMarkdown finds style elements in one pass when they are never closed or never reach >", async () => {
+    expect((await timed(() => mail(`<p>Hi</p>${"<style>".repeat(30_000)}`))).result?.markdown).toBe("Hi");
+    expect((await timed(() => mail(`${"<style ".repeat(30_000)}`))).result?.removed).toEqual([]);
+  });
+
+  it("mailToMarkdown strips a stylesheet's comments in one pass when none is closed", async () => {
+    expect((await timed(() => mail(`<style>${"/*a".repeat(50_000)}</style><p>Hi</p>`))).result?.markdown).toBe("Hi");
+  });
+
+  it("mailToMarkdown reads selectors in one pass when their pseudo-classes and attribute tests never close", async () => {
+    expect((await timed(() => mail(`<style>${":a(".repeat(50_000)}{display:none}</style><p>Hi</p>`))).result?.markdown).toBe("Hi");
+    // Only the last `[` is closed, so to a browser the `{` falls inside the others and opens no rule;
+    // the reader before this one read the last test, and what it hid is hidden.
+    expect((await timed(() => mail(`<style>${"[a=''".repeat(30_000)}]{display:none}</style><p a>A</p><p>B</p>`))).result?.markdown).toBe("B");
+    expect((await timed(() => mail(`<style>${"[a='']".repeat(30_000)}{display:none}</style><p a>A</p><p>B</p>`))).result?.markdown).toBe("B");
+  });
+
+  it("mailToMarkdown reads a stylesheet of blocks, brackets and strings never closed in one pass", async () => {
+    for (const piece of ["{", "(", "a{", ".x{display:none;", "}", "\"/*\n", "@a;"]) {
+      // At most 290,000 characters: past 300,000, mail isn't converted. 18,000 declarations take about
+      // 70 ms alone and passed 200 ms once in a full parallel run, so that piece gets more room.
+      const ms = piece === ".x{display:none;" ? 1_000 : undefined;
+      expect((await timed(() => mail(`<style>${piece.repeat(50_000).slice(0, 290_000)}</style><p>Hi</p>`), ms)).result?.markdown).toBe("Hi");
+    }
+  });
+
+  it("mailToMarkdown reads a long number as a CSS length in one pass", async () => {
+    expect((await timed(() => mail(`<p style="width:${"1".repeat(30_000)}x">Hi</p>`))).result?.markdown).toBe("Hi");
+    expect((await timed(() => mail(`<p style="font-size:${"1".repeat(30_000)}x%">Hi</p>`))).result?.markdown).toBe("Hi");
+  });
+
+  it("mailToMarkdown reads a transform of unclosed translate() calls in one pass", async () => {
+    expect((await timed(() => mail(`<p style="transform:${"translate(".repeat(29_000)}">Hi</p>`))).result?.markdown).toBe("Hi");
+  });
+
+  it("mailToMarkdown checks an image against tracking hosts in one pass", async () => {
+    expect((await timed(() => mail(`<img src="http://${"links.".repeat(30_000)}" alt="x">`))).result?.markdown).toBe("[image: x]");
+    expect((await timed(() => mail(`<img src="http://${"email.mg.".repeat(20_000)}" alt="x">`))).result?.markdown).toBe("[image: x]");
+  });
+
+  it("mailToMarkdown applies long rules and many hiding attributes to many elements without multiplying them", async () => {
+    const declarations = Array.from({ length: 3_000 }, (_, index) => `p${index}:1;`).join("");
+    const paragraphs = (open: string) => `${open}x</p>`.repeat(3_000);
+    const shown = Array<string>(3_000).fill("x").join("\n\n");
+    expect((await timed(() => mail(`<style>.x{${declarations}}</style>${paragraphs("<p class=x>")}`))).result?.markdown).toBe(shown);
+    expect((await timed(() => mail(`<style>p{${declarations}}</style>${paragraphs("<p>")}`))).result?.markdown).toBe(shown);
+    expect((await timed(() => mail(`<style>${Array<string>(3_000).fill(".x").join(",")}{display:none;${declarations}}</style><p>x</p>`))).result?.markdown).toBe("x");
+    const attributes = Array.from({ length: 3_000 }, (_, index) => `[a${index}]`).join(",");
+    expect((await timed(() => mail(`<style>${attributes}{display:none}</style>${paragraphs("<p>")}`))).result?.markdown).toBe(shown);
+  });
+
+  it("mailToMarkdown matches a selector of one class repeated or spelled in many cases against many elements, and an SVG of unclosed comments, in one pass", async () => {
+    const shown = Array<string>(3_000).fill("X").join("\n\n");
+    expect((await timed(() => mail(`<style>${".x".repeat(100_000)}{color:#123}</style>${"<p class=x>X</p>".repeat(3_000)}`))).result?.markdown).toBe(shown);
+    // Each spelling matches the element where case is ignored, as it is in quirks mode.
+    const name = "abcdefghijklmnop";
+    const cases = Array.from({ length: 8_000 }, (_, at) => `.${[...name].map((letter, bit) => ((at >> bit) & 1 ? letter.toUpperCase() : letter)).join("")}`).join("");
+    expect((await timed(() => mail(`<style>${cases}{color:#123}</style>${`<p class=${name}>X</p>`.repeat(3_000)}`))).result?.markdown).toBe(shown);
+    // A long class or attribute value, folded once, not at every element it is tested on.
+    const long = "A".repeat(150_000);
+    expect((await timed(() => mail(`<style>[x=${long}]{color:#123}</style>${"<p x=x>X</p>".repeat(3_000)}`))).result?.markdown).toBe(shown);
+    expect((await timed(() => mail(`<style>.x.${long}{color:#123}</style>${"<p class=x>X</p>".repeat(3_000)}`))).result?.markdown).toBe(shown);
+    // A long value, which would be read at every element it applies to, hides them unread.
+    expect((await timed(() => mail(`<style>.x{color:rgb(1 2 3${" ".repeat(150_000)})}</style>${"<p class=x>X</p>".repeat(3_000)}`))).result?.markdown).toBe("");
+    const comments = `<svg>${"<style><!--</style>".repeat(15_000)}</svg>`;
+    expect((await timed(() => mail(comments))).result?.markdown).toMatch(/^This message is written in a way that can't be read safely here/);
+  });
+
+  it("mailToMarkdown reads links opened inside links without reading each one's text once per link around it", async () => {
+    const link = "<a href=\"https://a.com/\">";
+    expect((await timed(() => mail(`${link.repeat(200)}${"x ".repeat(145_000)}`))).result?.markdown).toMatch(/^(\[\]\(https:\/\/a\.com\/\)){199}\[x x x /);
+  });
+
+  it("mailToMarkdown keeps what it reopens bounded once its copies run out, so end tags and links don't read it all", async () => {
+    // Once the copies a browser reopens ran out, the list kept to reopen grew with every paragraph
+    // that left a <b> open, each copying it, and every end tag or link with nothing to close read it
+    // all: these took 2 to 9 seconds each.
+    const spend = `<p>${"<b>".repeat(199)}</p>${"<p><b></p>".repeat(110)}`;
+    const room = MAX_MAIL_HTML_CHARS - spend.length - 1_000;
+    const grow = `<p>${"<b>".repeat(198)}</p>`.repeat(Math.floor(room / 2 / 601));
+    mail(spend); // warm up
+    // Each takes about 400 ms here; the bound is loose so a loaded CI machine doesn't flake.
+    for (const tail of ["</i>".repeat(Math.floor(room / 2 / 4)), "<a>".repeat(Math.floor(room / 2 / 3))]) {
+      expect((await timed(() => mail(spend + grow + tail), 2_000)).result).toMatchObject({ markdown: expect.stringMatching(/^\*\*\*\*/), truncated: true });
+    }
+    const content = "<p><b>x".repeat(Math.floor((MAX_MAIL_HTML_CHARS - 200) / 7));
+    const paragraphs = (await timed(() => mailToMarkdown({ contentType: "html", content }, { maxChars: 1_000_000 }), 2_000)).result;
+    expect(paragraphs?.markdown).toMatch(/^\*\*x\*\*\n\n\*\*\*\*x\*\*\*\*\n\n/);
+    // What follows is left out as a limit of this reader's, which a browser shows: not as hidden text.
+    expect(paragraphs).toMatchObject({ removed: [], truncated: true, hidesText: false });
+    expect(paragraphs?.markdown).toMatch(/\*\*\n\nSome of what follows is too complex to read here\. Open the original to read all of it\.$/);
+    // So is what holds only images: 100 of these 300 figures were left out without a word.
+    const figures = mailToMarkdown({ contentType: "html", content: Array.from({ length: 300 }, (_, n) => `<p><font id=f${n}><img alt="Figure ${n}"></p>`).join("") }, { maxChars: 1_000_000 });
+    expect(figures).toMatchObject({ truncated: true, hidesText: false });
+    expect(figures.markdown).toMatch(/Figure 199[^]*Some of what follows is too complex to read here\./);
+  });
+
+  it("mailToMarkdown holds no more elements open than a browser nests, so no end tag walks more", async () => {
+    // Each <html> or <body> once opened an element in the one before, not counted as deeper, and each
+    // </b> walked them all to the cell: 3.6 to 6.5 seconds in workerd. Now about 30 ms.
+    for (const page of ["<html>", "<body>"]) {
+      const crafted = `<b><table><td>${page.repeat(29_900)}${"</b>".repeat(29_900)}`;
+      expect((await timed(() => mail(crafted), 1_000)).result).toMatchObject({ markdown: "**\n\n**", hidesText: false });
+      // Each adds the attributes it hasn't to the page's, in place, costing only its own: copied
+      // whole at each, 16,000 of one attribute each took 23.5 seconds in workerd. Neither when each
+      // adds one nor when, past 8,000, each adds nothing.
+      const name = page.slice(1, -1);
+      const distinct = Array.from({ length: 16_000 }, (_, i) => `<${name} x${i}>`).join("");
+      const half = Array.from({ length: 8_000 }, (_, i) => `<${name} x${i}>`).join("");
+      const same = half + `<${name} x0>`.repeat(Math.floor((MAX_MAIL_HTML_CHARS - half.length - 100) / (name.length + 5)));
+      for (const tags of [distinct, same]) {
+        expect((await timed(() => mail(`${tags}VISIBLE`), 1_000)).result).toMatchObject({ markdown: "VISIBLE", removed: [], truncated: false, hidesText: false });
+      }
+    }
+    // At the most a browser nests, an end tag walks no more than that, and a ruby's part none: each
+    // takes 100 to 300 ms here, and the bound is loose so a loaded CI machine doesn't flake.
+    const deep = `<table><td>${"<span>".repeat(505)}`;
+    for (const [head, tail] of [[`<b>${deep}`, "</b>"], [`<div>${deep}`, "</div>"], [`<ruby>${"<span>".repeat(505)}`, "<rt>"]] as const) {
+      const crafted = head + tail.repeat(Math.floor((MAX_MAIL_HTML_CHARS - head.length - 100) / tail.length));
+      expect((await timed(() => mail(crafted), 2_000)).result?.truncated).toBe(false);
+    }
+  });
+
+  it("mailToMarkdown reads a reopened element's attributes once, however many copies it reopens", async () => {
+    // Each copy of a formatting element left open read its style, class list and colour again: a
+    // 2,000-character style over the paragraphs after it took 3.1 seconds here and 3.4 in workerd,
+    // and a 20,000-character one 30 seconds in workerd. Read once, a copy costs the same however
+    // long they are, so every paragraph shows, as in a browser.
+    const heads = [
+      `<p><b style="${"color:red;".repeat(200)}">x`,
+      `<style>.c1{color:red}</style><p><b class="${Array.from({ length: 600 }, (_, i) => `c${i}`).join(" ")}">x`,
+      `<p><font color="${"a".repeat(60_000)}">x`,
+      `<p><b style="${`font-family:Arial;font-size:11pt;color:#222222;${"mso-ansi-language:EN-US;".repeat(40)}`}">x`,
+    ];
+    for (const head of heads) {
+      const crafted = head + "<p>x".repeat(Math.floor((MAX_MAIL_HTML_CHARS - head.length - 100) / 4));
+      expect((await timed(() => mail(crafted), 2_000)).result?.markdown).toMatch(/^(\*\*)?x(\*\*)?\n\n/);
+      // 6,000 paragraphs, as many copies, under what is reopened for one message: once each copy
+      // was charged by its attributes, a 1,007-character style left the last 2,083 out as hidden text.
+      const converted = mailToMarkdown({ contentType: "html", content: head + "<p>x".repeat(6_000) }, { maxChars: 1_000_000 });
+      expect(converted.markdown.match(/x/g)).toHaveLength(6_001);
+      expect(converted).toMatchObject({ removed: [], truncated: false, hidesText: false });
+    }
+  });
+
+  it("mailToMarkdown writes no more of the addresses of links reopened as copies than it can hold", async () => {
+    // A link is written again with each copy, and its address can grow as it is written: 200 copies
+    // of a 20,000-character one wrote 20 to 36 million characters and held some 400 MB in Node.
+    // Past MAX_LINK_CHARS, a link is written as its text alone, saying so.
+    for (const address of ["漢".repeat(20_000), `?${"&".repeat(20_000)}`, "a".repeat(2_000)]) {
+      const head = `<p><a href="https://e.test/${address}">x`;
+      const converted = (await timed(() => mailToMarkdown({ contentType: "html", content: head + "<p>x".repeat(15_000) }, { maxChars: 10_000_000 }), 2_000)).result;
+      expect(converted?.markdown.match(/x/g)).toHaveLength(15_001);
+      expect(converted?.removed).toEqual([expect.stringMatching(/^the addresses of \d+ links, past the most shown here$/)]);
+      expect(converted).toMatchObject({ truncated: true, hidesText: false });
+    }
+  });
+
+  it("htmlToMarkdown writes a long line of short pieces in one pass, in a paragraph or a table cell", async () => {
+    expect((await timed(() => htmlToMarkdown("x<b></b>".repeat(50_000)))).result).toBe("x****".repeat(50_000));
+    expect((await timed(() => htmlToMarkdown(`<table><tr><td>${"x<b></b>".repeat(50_000)}</td></tr></table>`))).result)
+      .toBe(`|  |\n| --- |\n| ${"x****".repeat(50_000)} |`);
+  });
+
+  it("pageMarkdown converts no more of a page's HTML than readFile converts of a file's, saying so", () => {
+    const part = { kind: "text" as const, html: `<p>${"a ".repeat(600_000)}</p>` };
+    const page = pageMarkdown("T", [part, part, { kind: "text", html: "<p>last</p>" }]);
+    expect(page.markdown).not.toContain("last");
+    expect(page.note).toBe("Truncated: the page's text is longer than 2,000,000 characters of HTML.");
+    expect(pageMarkdown("T", [{ kind: "text", html: "<p>last</p>" }])).toEqual({ markdown: "# T\n\nlast" });
   });
 });
