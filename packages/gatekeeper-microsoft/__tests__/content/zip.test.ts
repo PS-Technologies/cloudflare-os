@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { Inflate } from "pako";
+import { describe, expect, it, vi } from "vitest";
 import { buildZip, deflateRaw } from "./test-fixtures";
 import { ZipError, crc32, openZip, type ZipErrorCode } from "../../src/content/zip";
 import { writeZip } from "../../src/content/zip-write";
@@ -18,6 +19,35 @@ function patchUint16(bytes: Uint8Array, offset: number, value: number): Uint8Arr
   const copy = bytes.slice();
   new DataView(copy.buffer).setUint16(offset, value, true);
   return copy;
+}
+
+/** `size` zeros deflated into an entry that claims `declared` bytes: written as stored, then relabelled deflated in both headers. */
+async function deflatedBomb(size: number, declared = 100): Promise<Uint8Array> {
+  const archive = await buildZip([{ name: "bomb", data: await deflateRaw(new Uint8Array(size)), method: "store", declaredSize: declared }]);
+  const centralStart = archive.length - 22 - 50;
+  return patchUint16(patchUint16(archive, 8, 8), centralStart + 10, 8);
+}
+
+/** `stream` as a deflated entry holding `text`, so a reader that accepts the stream reads `text` and passes every check. */
+async function deflatedEntry(stream: Uint8Array, text: string): Promise<Uint8Array> {
+  const bytes = new TextEncoder().encode(text);
+  const archive = await buildZip([{ name: "a.txt", data: stream, method: "store", declaredSize: bytes.length, crc: crc32(bytes) }]);
+  return patchUint16(patchUint16(archive, 8, 8), archive.length - 22 - 51 + 10, 8);
+}
+
+/**
+ * workerd's DecompressionStream inflates whatever is written to it whether or not anything reads
+ * the output: it applies no backpressure. This stand-in for it does the same.
+ */
+class EagerDecompressionStream extends TransformStream<Uint8Array, Uint8Array> {
+  constructor() {
+    const inflater = new Inflate({ raw: true });
+    super({
+      start: controller => { inflater.onData = chunk => controller.enqueue(chunk); },
+      transform: chunk => { inflater.push(chunk, false); },
+      flush: () => { inflater.push(new Uint8Array(0), true); },
+    }, undefined, { highWaterMark: Infinity });
+  }
 }
 
 describe("openZip", () => {
@@ -121,9 +151,32 @@ describe("openZip", () => {
     await expect(openZip(corrupt).readText("a.txt")).rejects.toBeInstanceOf(ZipError);
   });
 
+  it("refuses deflate data cut short or followed by trailing bytes", async () => {
+    const text = "hello world hello world";
+    // One stored block not marked final: complete output, but the stream never ends.
+    const unfinished = new Uint8Array([0x00, text.length, 0x00, ~text.length & 0xff, 0xff, ...new TextEncoder().encode(text)]);
+    await expectZipError(openZip(await deflatedEntry(unfinished, text)).readText("a.txt"), "malformed");
+    const trailing = new Uint8Array([...await deflateRaw(new TextEncoder().encode(text)), 1, 2, 3]);
+    await expectZipError(openZip(await deflatedEntry(trailing, text)).readText("a.txt"), "malformed");
+    // The same bytes, well formed, read: the refusals above are the stream's and nothing else.
+    expect(await openZip(await deflatedEntry(await deflateRaw(new TextEncoder().encode(text)), text)).readText("a.txt")).toBe(text);
+  });
+
   it("refuses an entry whose real size differs from what it declares", async () => {
     const zip = openZip(await buildZip([{ name: "a.txt", data: "hello", declaredSize: 50 }]));
     await expectZipError(zip.readText("a.txt"), "malformed");
+  });
+
+  it("keeps traversal names inert rather than aliasing Office parts", async () => {
+    const zip = openZip(await buildZip([
+      { name: "../word/document.xml", data: "crafted" },
+      { name: "word/document.xml", data: "legitimate" },
+      { name: "../outside", data: "inert" },
+    ]));
+    expect(await zip.readText("word/document.xml")).toBe("legitimate");
+    expect(await zip.readText("../word/document.xml")).toBe("crafted");
+    expect(zip.has("outside")).toBe(false);
+    await expectZipError(zip.readBytes("outside"), "not-found");
   });
 
   describe("decompression bombs", () => {
@@ -132,7 +185,7 @@ describe("openZip", () => {
       await expectZipError(zip.readBytes("big"), "entry-too-large");
     });
 
-    it("stops inflating once the output passes the limit, whatever the entry declares", async () => {
+    it("stops inflating once the output passes what the entry declares", async () => {
       // 30 MiB of zeros deflates to about 30 KiB; it claims to be 100 bytes.
       const zeros = new Uint8Array(30 * 1024 * 1024);
       const compressed = await deflateRaw(zeros);
@@ -142,8 +195,39 @@ describe("openZip", () => {
       const centralStart = archive.length - 22 - 50;
       const patched = patchUint16(patchUint16(archive, 8, 8), centralStart + 10, 8);
       const started = performance.now();
-      await expectZipError(openZip(patched).readBytes("bomb"), "entry-too-large");
+      await expectZipError(openZip(patched).readBytes("bomb"), "malformed");
       expect(performance.now() - started).toBeLessThan(5_000);
+    });
+
+    it("never inflates much past what an entry declares, within the limit, on a runtime whose inflater does not wait for its reader", async () => {
+      let inflated = 0;
+      const counted = new WeakSet<Inflate>();
+      const push = Inflate.prototype.push;
+      vi.spyOn(Inflate.prototype, "push").mockImplementation(function (this: Inflate, ...args: Parameters<Inflate["push"]>) {
+        if (!counted.has(this)) {
+          counted.add(this);
+          const onData = this.onData;
+          this.onData = chunk => {
+            inflated += chunk.length;
+            onData.call(this, chunk);
+          };
+        }
+        return push.apply(this, args);
+      });
+      vi.stubGlobal("DecompressionStream", EagerDecompressionStream);
+      try {
+        const zip = openZip(await deflatedBomb(32 * 1024 * 1024, 1024 * 1024), { maxEntryBytes: 1024 * 1024 });
+        await expectZipError(zip.readBytes("bomb"), "malformed");
+        // What it declares plus at most one 64 KiB output chunk, not the 32 MiB the entry inflates to.
+        expect(inflated).toBeLessThanOrEqual(1024 * 1024 + 64 * 1024);
+        // Declaring less than the limit, it costs no more than it declares and one chunk.
+        inflated = 0;
+        await expectZipError(openZip(await deflatedBomb(32 * 1024 * 1024), { maxEntryBytes: 1024 * 1024 }).readBytes("bomb"), "malformed");
+        expect(inflated).toBeLessThanOrEqual(100 + 64 * 1024);
+      } finally {
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+      }
     });
 
     it("bounds the total inflated across one archive's entries, counting an entry once however often it is read", async () => {

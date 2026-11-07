@@ -285,13 +285,21 @@ function workbookMarkdown(worksheets: readonly WorksheetContent[]): string {
 
 // -- pages --------------------------------------------------------------------------------------
 
+/**
+ * The most of a page's HTML converted: as much as `readFile` converts at its largest `maxChars`. A
+ * page's body can be 8 MB, and converting that much crafted HTML outgrows an isolate's heap.
+ */
+const MAX_PAGE_HTML_CHARS = MAX_MAX_CHARS * 4;
+
 /** A page's web parts as Markdown, and a note naming what could not be read. */
 export function pageMarkdown(title: string, parts: readonly PageWebPart[]): { markdown: string; note?: string } {
   const blocks = [`# ${title.replace(/[\r\n]+/g, " ")}`];
   const other: string[] = [];
+  let left = MAX_PAGE_HTML_CHARS;
   for (const part of parts) {
     if (part.kind === "text") {
-      const markdown = htmlToMarkdown(part.html);
+      const markdown = left > 0 ? htmlToMarkdown(part.html.slice(0, left)) : "";
+      left -= part.html.length;
       if (markdown) blocks.push(markdown);
     } else {
       other.push(part.title ?? "untitled web part");
@@ -303,5 +311,6 @@ export function pageMarkdown(title: string, parts: readonly PageWebPart[]): { ma
       "home page) often have content Graph can't read.");
   }
   if (other.length > 0) notes.push(`Not text, so not included: ${other.slice(0, 10).join(", ")}${other.length > 10 ? ", …" : ""}.`);
+  if (left < 0) notes.push(`Truncated: the page's text is longer than ${MAX_PAGE_HTML_CHARS.toLocaleString("en-US")} characters of HTML.`);
   return { markdown: blocks.join("\n\n"), ...(notes.length ? { note: notes.join(" ") } : {}) };
 }
