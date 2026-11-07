@@ -826,6 +826,9 @@ importers:
       capnweb-validate:
         specifier: 'catalog:'
         version: 0.3.0(capnweb@0.12.0)(esbuild@0.28.2)(rollup@4.62.3)(vite@7.3.6(@types/node@26.1.0)(jiti@2.7.0)(lightningcss@1.33.0)(terser@5.51.2)(yaml@2.9.1))
+      pako:
+        specifier: ^3.0.2
+        version: 3.0.2
     devDependencies:
       '@cloudflare/vitest-plugin':
         specifier: 'catalog:'
@@ -5008,6 +5011,9 @@ packages:
 
   pako@1.0.11:
     resolution: {integrity: sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw==}
+
+  pako@3.0.2:
+    resolution: {integrity: sha512-uBv6IT2aT1A78iU6dpNEbf6+CyhlV/6g9JlJs9kpgjFGFhruIICVRysF/W0SLzXg5+hCl+KroH7e4YUyfEmgLg==}
 
   parse-entities@4.0.2:
     resolution: {integrity: sha512-GG2AQYWoLgL877gQIKeRPGO1xF9+eG1ujIb5soS5gPvLQ1y2o8FL90w2QWNdf9I361Mpp7726c+lj3U0qK1uGw==}
@@ -9227,6 +9233,8 @@ snapshots:
       netmask: 2.1.1
 
   pako@1.0.11: {}
+
+  pako@3.0.2: {}
 
   parse-entities@4.0.2:
     dependencies:
