@@ -11,7 +11,7 @@
 
 import { escapeHtml } from "@gadgets/gatekeeper-kit/connect-pages";
 import { parseMarkdown, safeHref as safeMarkdownHref, type MdBlock, type MdInline } from "./content/markdown-parse";
-import { VOID, decodeEntities, htmlToMarkdown, tokenize, trimTrailingBlanks } from "./html-markdown";
+import { VOID, asciiLowerCase, decodeEntities, htmlToMarkdown, tokenize, trimTrailingBlanks, type Sheet, type Styles } from "./html-markdown";
 import type { AttachmentInput, EmailAddress, MessageLink, SenderKind } from "./outlook-types";
 
 // -- reading ------------------------------------------------------------------------------------
@@ -25,8 +25,23 @@ export type MailMarkdown = {
 
 /** The most links listed for one message. */
 export const MAX_LINKS = 200;
-/** How deep the tree is built; anything deeper is attached at this depth, flattened. */
-const MAX_DEPTH = 200;
+/**
+ * How deep the tree is built: as deep as Chromium's parser nests elements, counting its <html> and
+ * <body> and the table parts it adds. Past it Chromium attaches an element beside the one it would be
+ * in, and puts the text inside it there too; HTML nested that deep is not read at all ({@link UNREADABLE}).
+ * Flattened at 200, an element past it held none of the text inside it, and its end tags closed
+ * elements outside it, so text a browser keeps in a hidden element was shown.
+ */
+const MAX_DEPTH = 512;
+/**
+ * The most HTML converted, in characters. Crafted HTML this long holds the converter's heap under
+ * 96 MB in workerd, of a Worker's 128 MB, and an ordinary newsletter is well under it. Past it the
+ * HTML is not converted: what is read is a note to open the original, so nothing hidden is shown.
+ */
+export const MAX_MAIL_HTML_CHARS = 300_000;
+const TOO_LONG = "This is too long to read here. Open the original to read it.";
+/** What is read of HTML a browser may read otherwise than this does ({@link tokenize}): nothing, so nothing hidden is shown. */
+const UNREADABLE = "This message is written in a way that can't be read safely here. Open the original to read it.";
 
 /**
  * Characters a person can't see: Unicode's default-ignorable set (zero-width spaces and joiners,
@@ -49,80 +64,993 @@ const DROPPED = new Set([
   "form", "input", "button", "select", "option", "textarea", "svg", "math", "audio", "video", "canvas", "map", "link", "meta",
 ]);
 
-/** Elements that end a paragraph when opened inside one, as browsers close them. */
-const CLOSES_P = new Set(["p", "div", "table", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "hr", "section", "article", "header", "footer"]);
+/**
+ * Elements that end a paragraph when opened inside one, as browsers close them. Not a table: a
+ * browser reading mail without a doctype, as most is, opens it inside the paragraph.
+ */
+const CLOSES_P = new Set([
+  "address", "article", "aside", "blockquote", "center", "dd", "details", "dialog", "dir", "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer",
+  "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "li", "listing", "main", "menu", "nav", "ol", "p", "plaintext", "pre", "search",
+  "section", "summary", "ul", "xmp",
+]);
+/** Start tags a browser ignores outside a table. */
+const TABLE_PARTS = new Set(["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"]);
+/** A table's row groups, which a browser adds a <tbody> for when a row is written without one. */
+const SECTIONS = new Set(["tbody", "tfoot", "thead"]);
 
-type Element = { tag: string; attrs: Record<string, string>; children: Node[]; parent: Element | null };
+/** The open elements a link can't close an older link across: tables and the HTML spec's markers. */
+const LINK_SCOPE = ["table", "td", "th", "caption", "object", "applet", "marquee", "template"];
+/** The HTML spec's markers: a formatting element closed inside one is never reopened outside it. */
+const MARKERS = new Set(["td", "th", "caption", "object", "applet", "marquee", "template"]);
+/** The HTML spec's formatting elements. */
+const FORMATTING = new Set(["a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u"]);
+/** The HTML spec's special elements: blocks, tables, lists, forms, and the like. */
+const SPECIAL = new Set([
+  "address", "applet", "area", "article", "aside", "base", "basefont", "bgsound", "blockquote", "body", "br", "button", "caption", "center", "col",
+  "colgroup", "dd", "details", "dir", "div", "dl", "dt", "embed", "fieldset", "figcaption", "figure", "footer", "form", "frame", "frameset",
+  "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hgroup", "hr", "html", "iframe", "img", "input", "keygen", "li", "link", "listing", "main",
+  "marquee", "menu", "meta", "nav", "noembed", "noframes", "noscript", "object", "ol", "p", "param", "plaintext", "pre", "script", "search", "section",
+  "select", "source", "style", "summary", "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "title", "tr", "track", "ul", "wbr", "xmp",
+]);
+/** Special elements a browser opens as it does text, reopening formatting elements first. */
+const INLINE_SPECIAL = new Set(["applet", "area", "br", "button", "embed", "img", "input", "keygen", "marquee", "object", "select", "wbr", "xmp"]);
+/** The HTML spec's scopes: an end tag whose element is open only past one of these is ignored. */
+const SCOPE = new Set(LINK_SCOPE);
+const BUTTON_SCOPE = new Set([...LINK_SCOPE, "button"]);
+const LIST_ITEM_SCOPE = new Set([...LINK_SCOPE, "ol", "ul"]);
+const TABLE_SCOPE = new Set(["table", "template"]);
+/** Where a browser stops looking for an <li> to close: any special element but these. */
+const LIST_ITEM_STOPS = new Set([...SPECIAL].filter(tag => tag !== "address" && tag !== "div" && tag !== "p"));
+/** Where a browser stops looking for the element an end tag names: any special element stops an ordinary one (</span>). */
+const endTagScope = (tag: string): ReadonlySet<string> =>
+  tag === "table" || TABLE_PARTS.has(tag) ? TABLE_SCOPE : tag === "p" ? BUTTON_SCOPE : tag === "li" ? LIST_ITEM_SCOPE : SPECIAL.has(tag) ? SCOPE : SPECIAL;
+/**
+ * The most copies of formatting elements reopened for one message. Each text can need every one
+ * an end tag closed, so a crafted message could otherwise make them by the million; past this, text
+ * that would be inside them is put in a hidden element instead.
+ */
+const MAX_REOPENED = 20_000;
+/**
+ * The most formatting elements alike (one tag, the same attributes) reopened together, as the HTML
+ * spec's "Noah's Ark" clause keeps at most three in its list. Without it, a paragraph that leaves a
+ * <font> open reopened every earlier one's, and ordinary mail spent MAX_REOPENED in 200 paragraphs.
+ */
+const MAX_ALIKE = 3;
+
+/** An element: `legacy`, its attributes as the reader before this one read them, where they differ ({@link pinHides}). */
+type Element = { tag: string; attrs: Record<string, string>; legacy?: Record<string, string>; children: Node[]; parent: Element | null };
 type Node = Element | { text: string };
 
 const isElement = (node: Node): node is Element => "tag" in node;
 
-/** Builds a tree from tokens, closing elements as a browser would, with depth bounded. */
-function buildTree(html: string): { root: Element; base?: string } {
-  const root: Element = { tag: "#root", attrs: {}, children: [], parent: null };
+/** Formatting elements to reopen, in order, with how many of each tag and of each alike set ({@link MAX_ALIKE}) it holds. */
+type Pending = { elements: Element[]; tags: Map<string, number>; alike: Map<string, number> };
+
+/** Attributes spelled out in name order, once for each set (a copy shares its original's). */
+const spelled = new WeakMap<Record<string, string>, string>();
+const spelling = (attrs: Record<string, string> | undefined): string => {
+  if (attrs === undefined) return "";
+  let text = spelled.get(attrs);
+  if (text === undefined) spelled.set(attrs, text = JSON.stringify(Object.entries(attrs).toSorted(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))));
+  return text;
+};
+/** What makes formatting elements alike: tag and attributes, as read now and as the reader before this one read them. */
+const alikeKey = (element: Element) => `${element.tag}\u0000${spelling(element.attrs)}\u0000${spelling(element.legacy)}`;
+
+/** Builds a tree from tokens, closing elements as a browser would, and gathers the stylesheets; `styles.unreadable` when it is deeper than MAX_DEPTH. */
+function buildTree(html: string): { root: Element; base?: string; styles: Styles } {
+  // Named as no rule names an element (`#root` is an ID's), so only a `*` rule applies to it.
+  const root: Element = { tag: "", attrs: {}, children: [], parent: null };
+  const styles: Styles = { sheets: [], unreadable: false };
   let current = root;
-  let depth = 0;
+  // How deep a browser's tree is here ({@link MAX_DEPTH}): from its <html> and <body>, with the
+  // <tbody> and <tr> it adds around a row or cell written straight into a table (`implied`).
+  let depth = 2;
+  const implied = new WeakMap<Element, number>();
   let base: string | undefined;
-  const closeTo = (tag: string): boolean => {
-    let node: Element | null = current;
-    let steps = 0;
-    while (node && node !== root && node.tag !== tag) {
-      node = node.parent;
-      steps++;
+  // The link each open element is in, unless LINK_SCOPE comes between, and the marker each is in (the
+  // root when none is): looked up, so an <a> under a deep stack doesn't walk it.
+  const linkOf = new Map<Element, Element>();
+  const markerOf = new Map<Element, Element>();
+  // The open elements inside a <table>, so a table part's start tag doesn't walk the stack to find
+  // one, and how many of each tag are open, so an end tag for one that isn't doesn't walk it either.
+  const tabled = new WeakSet<Element>();
+  const openTags = new Map<string, number>();
+  const closing = (node: Element) => {
+    depth -= 1 + (implied.get(node) ?? 0);
+    openTags.set(node.tag, openTags.get(node.tag)! - 1);
+  };
+  // By marker, formatting elements closed but not by their own end tag, which a browser reopens, as
+  // copies, before the next text or inline element inside that marker. A list is appended to in
+  // place and emptied as it is reopened, and an end tag's element is looked for in it only when its
+  // count says it is there.
+  const pending = new Map<Element, Pending>();
+  // Markers in which MAX_REOPENED ran out: until one closes, text in it goes in a hidden element
+  // (`hiders`), and nothing more is kept to reopen. Before, the list kept growing, read whole at
+  // every end tag and copied at every close, so a crafted message took seconds.
+  const spent = new Set<Element>();
+  const hiders = new WeakSet<Element>();
+  let reopened = 0;
+  const open = (tag: string, attrs: Record<string, string>, enters = true, legacy?: Record<string, string>) => {
+    // A browser has one <html> and one <body>, counted already, and adds a <tbody> or <tr> a table
+    // part needs: counted for any not written just outside it, so never fewer than it adds.
+    const adds = tag === "html" || tag === "body" ? -1
+      : tag === "tr" ? (SECTIONS.has(current.tag) ? 0 : 1)
+      : tag === "td" || tag === "th" ? (current.tag === "tr" ? 0 : SECTIONS.has(current.tag) ? 1 : 2) : 0;
+    // A browser attaches an element deeper than this beside the one it would be in, and text in it there.
+    if (depth + adds > MAX_DEPTH) {
+      styles.unreadable = true;
+      return;
     }
-    if (!node || node === root) return false;
-    current = node.parent!;
-    depth -= steps + 1;
+    const element: Element = { tag, attrs, children: [], parent: current };
+    if (legacy) element.legacy = legacy;
+    current.children.push(element);
+    if (!enters) return;
+    if (adds !== 0) implied.set(element, adds);
+    const link = tag === "a" ? element : linkOf.get(current);
+    if (link && !LINK_SCOPE.includes(tag)) linkOf.set(element, link);
+    markerOf.set(element, MARKERS.has(tag) ? element : markerOf.get(current) ?? root);
+    if (tag === "table" || tabled.has(current)) tabled.add(element);
+    openTags.set(tag, (openTags.get(tag) ?? 0) + 1);
+    current = element;
+    depth += 1 + adds;
+  };
+  const remove = (list: Pending, at: number) => {
+    const [element] = list.elements.splice(at, 1);
+    list.tags.set(element!.tag, list.tags.get(element!.tag)! - 1);
+    const key = alikeKey(element!);
+    list.alike.set(key, list.alike.get(key)! - 1);
+  };
+  /** Puts what follows in a hidden element, unless it already is in one put there for `marker`. */
+  const hide = (marker: Element) => {
+    for (let node = current; node !== marker && node !== root; node = node.parent!) if (hiders.has(node)) return;
+    const outside = current;
+    open("span", { hidden: "" });
+    if (current !== outside) hiders.add(current);
+  };
+  const reopen = () => {
+    const marker = markerOf.get(current) ?? root;
+    if (spent.has(marker)) {
+      hide(marker);
+      return;
+    }
+    const list = pending.get(marker);
+    if (!list) return;
+    pending.delete(marker);
+    if (reopened + list.elements.length > MAX_REOPENED) {
+      spent.add(marker);
+      hide(marker);
+      return;
+    }
+    reopened += list.elements.length;
+    for (const { tag, attrs, legacy } of list.elements) open(tag, attrs, true, legacy);
+  };
+  /** Adds formatting elements just closed, outermost first, to those to reopen where the tree now is. */
+  const queue = (elements: readonly Element[]) => {
+    if (elements.length === 0) return;
+    const marker = markerOf.get(current) ?? root;
+    if (spent.has(marker)) return;
+    let list = pending.get(marker);
+    if (!list) pending.set(marker, list = { elements: [], tags: new Map(), alike: new Map() });
+    for (const element of elements) {
+      const key = alikeKey(element);
+      // A fourth alike drops the earliest, as a browser's list does.
+      if ((list.alike.get(key) ?? 0) >= MAX_ALIKE) remove(list, list.elements.findIndex(other => alikeKey(other) === key));
+      list.elements.push(element);
+      list.tags.set(element.tag, (list.tags.get(element.tag) ?? 0) + 1);
+      list.alike.set(key, (list.alike.get(key) ?? 0) + 1);
+    }
+  };
+  /** Takes the last pending `tag` off its list, as a browser does when its end tag comes before it's reopened. */
+  const forget = (tag: string): boolean => {
+    const marker = markerOf.get(current) ?? root;
+    const list = pending.get(marker);
+    if (!list?.tags.get(tag)) return false;
+    remove(list, list.elements.findLastIndex(element => element.tag === tag));
+    if (list.elements.length === 0) pending.delete(marker);
     return true;
   };
-  const closeIfOpen = (tags: readonly string[], stopAt: readonly string[]) => {
+  // An end tag, or a start tag that ends a paragraph or cell, closes the elements open inside the one
+  // it closes. A browser reopens the formatting elements among them, unless a marker it closed held
+  // them, so text after them is still in them, and hidden by whatever hid them; this does the same.
+  // An end tag is ignored, as a browser ignores it, when `stops` comes before the element it names.
+  const closeTo = (tag: string, stops?: ReadonlySet<string>): boolean => {
+    if (!openTags.get(tag)) return false;
+    let target: Element | null = current;
+    while (target && target !== root && target.tag !== tag) {
+      if (stops?.has(target.tag)) return false;
+      target = target.parent;
+    }
+    if (!target || target === root) return false;
+    let closed: Element[] = [];
+    for (let node = current; ; node = node.parent!) {
+      closing(node);
+      if (MARKERS.has(node.tag)) {
+        closed = [];
+        pending.delete(node);
+        spent.delete(node);
+      } else if (node !== target && FORMATTING.has(node.tag)) {
+        closed.push(node);
+      }
+      if (node === target) break;
+    }
+    current = target.parent!;
+    queue(closed.toReversed());
+    return true;
+  };
+  const closeIfOpen = (tags: readonly string[], stopAt: ReadonlySet<string>) => {
+    if (!tags.some(tag => openTags.get(tag))) return;
     for (let node: Element | null = current; node && node !== root; node = node.parent) {
-      if (stopAt.includes(node.tag)) return;
       if (tags.includes(node.tag)) {
         closeTo(node.tag);
         return;
       }
+      if (stopAt.has(node.tag)) return;
     }
   };
-  for (const token of tokenize(html)) {
+  const inTable = () => tabled.has(current);
+  /** The open formatting element an end tag names, unless a table, cell or marker comes first. */
+  const openFormatting = (tag: string): Element | undefined => {
+    if (tag === "a") return linkOf.get(current);
+    if (!openTags.get(tag)) return undefined;
+    for (let node = current; node !== root; node = node.parent!) {
+      if (node.tag === tag) return node;
+      if (SCOPE.has(node.tag)) return undefined;
+    }
+  };
+  // Closes a formatting element as a browser's parser does, for its end tag, and a link for a link
+  // opened inside it too, so no link holds another and each link's text is its own. Of the elements
+  // open inside it, a browser keeps the special ones (div, li) open, and the formatting ones (bold,
+  // font) around them; reopens the formatting ones inside the innermost special one before the next
+  // text; and closes the rest (span). This does the same, keeping elements open as copies. A browser
+  // gives up with eight special elements inside and leaves the element open; so does this, and when
+  // the copies would pass MAX_REOPENED.
+  const closeFormatting = (element: Element) => {
+    const inside: Element[] = [];
+    for (let node = current; node !== element; node = node.parent!) inside.push(node);
+    const special = inside.findIndex(node => SPECIAL.has(node.tag));
+    const kept = special === -1 ? [] : inside.slice(special).filter(node => FORMATTING.has(node.tag) || SPECIAL.has(node.tag));
+    if (kept.filter(node => SPECIAL.has(node.tag)).length >= 8 || reopened + kept.length > MAX_REOPENED) return;
+    for (const node of inside) closing(node);
+    closing(element);
+    current = element.parent!;
+    reopened += kept.length;
+    for (const { tag, attrs, legacy } of kept.toReversed()) open(tag, attrs, true, legacy);
+    queue((special === -1 ? inside : inside.slice(0, special)).filter(node => FORMATTING.has(node.tag)).toReversed());
+  };
+  for (const token of tokenize(html, styles)) {
+    // Too deep ({@link MAX_DEPTH}): nothing more is read.
+    if (styles.unreadable) break;
     if (token.type === "text") {
+      if ((pending.size > 0 || spent.size > 0) && /[^ \t\n\f\r]/.test(token.text)) reopen();
       current.children.push({ text: token.text });
       continue;
     }
-    // Outlook's namespaced tags (`o:p`, `v:shape`) tokenize as their prefix; they carry nothing.
+    // Outlook's namespaced tags (`o:p`, `v:shape`) are named whole, as a browser names them: elements it doesn't know.
     const tag = token.tag;
     if (token.type === "close") {
-      closeTo(tag);
+      // A browser's </body> and </html> close nothing: what follows goes where the document was.
+      if (tag === "body" || tag === "html") continue;
+      if (!FORMATTING.has(tag)) {
+        closeTo(tag, endTagScope(tag));
+      } else if (!forget(tag)) {
+        // An </a> closes only a link in its own table cell, as a browser's does: a nested link's
+        // leftover </a> must not close a link around the table.
+        const element = openFormatting(tag);
+        if (element) closeFormatting(element);
+      }
       continue;
     }
     if (tag === "base") {
       base ??= token.attrs.href;
       continue;
     }
-    if (tag === "p" || CLOSES_P.has(tag)) closeIfOpen(["p"], ["table", "td", "th", "li", "blockquote"]);
-    if (tag === "li") closeIfOpen(["li"], ["ul", "ol"]);
-    if (tag === "td" || tag === "th") closeIfOpen(["td", "th"], ["table"]);
-    if (tag === "tr") closeIfOpen(["td", "th", "tr"], ["table"]);
-    const element: Element = { tag, attrs: token.attrs, children: [], parent: current };
-    current.children.push(element);
-    if (!token.selfClosing && !VOID.has(tag) && depth < MAX_DEPTH) {
-      current = element;
-      depth++;
+    if (TABLE_PARTS.has(tag) && !inTable()) continue;
+    if (tag === "a" && !forget("a")) {
+      const link = linkOf.get(current);
+      if (link) closeFormatting(link);
     }
+    if (!SPECIAL.has(tag) || INLINE_SPECIAL.has(tag)) reopen();
+    if (tag === "li") closeIfOpen(["li"], LIST_ITEM_STOPS);
+    if (CLOSES_P.has(tag)) closeIfOpen(["p"], BUTTON_SCOPE);
+    if (tag === "td" || tag === "th") closeIfOpen(["td", "th"], TABLE_SCOPE);
+    if (tag === "tr") closeIfOpen(["td", "th", "tr"], TABLE_SCOPE);
+    open(tag, token.attrs, !token.selfClosing && !VOID.has(tag), token.legacy);
   }
-  return { root, ...(base !== undefined ? { base } : {}) };
+  return { root, styles, ...(base !== undefined ? { base } : {}) };
 }
 
-/** CSS declarations (`a: b; c: d`) by property, lower-cased, `!important` dropped. */
 /**
- * Each `selectors { declarations }` of a stylesheet, in one pass. A selector list runs from the
- * nearest `{`, `}` or `@` before its brace, so an at-rule's prelude is never one, and a block that
- * holds other blocks (`@media`) yields no rule itself, only the rules inside it. The regex
- * `/([^{}@]+)\{([^{}]*)\}/g` found the same rules but backtracked quadratically over a long
- * stylesheet with no braces.
+ * A style rule: its selector list, its own declarations, whether it is nested in another style rule,
+ * and whether it is in an at-rule's block (`@media print`, `@supports`), which may not apply.
  */
-function cssRules(css: string): { selectors: string; declarations: string }[] {
-  const rules: { selectors: string; declarations: string }[] = [];
+type CssRule = { selectors: string; declarations: string; nested: boolean; conditional: boolean };
+
+/** An `@media` prelude of only `print` and `only print` queries, which no screen matches. */
+const PRINT_ONLY = /^@media[\t\n\f\r ]+(?:only[\t\n\f\r ]+)?print[\t\n\f\r ]*(?:,[\t\n\f\r ]*(?:only[\t\n\f\r ]+)?print[\t\n\f\r ]*)*$/i;
+
+/**
+ * Each style rule of a stylesheet skeleton ({@link cssSkeleton}), in one pass, its blocks read as CSS
+ * Syntax reads them. A rule's prelude runs from the end of the rule, at-rule or declaration before
+ * it to its `{`: at the top level a stray `}` or `;` is part of it, and a leading `<!--` or `-->` is
+ * not. A block with no prelude is a rule a browser drops, with all it holds. A rule's declarations
+ * are its block's own text, without the rules nested in it, so those after a nested rule count too.
+ * An at-rule ends at its `;` or its block, which holds rules. A `{`, `}` or `;` inside `(…)` or
+ * `[…]` opens, closes and ends nothing, so a semicolon there is blanked: a function left open takes
+ * the rest of the sheet. A block left open runs to the end of the sheet. Brackets cost a byte each,
+ * so deep nesting costs little. Nothing in an `@media` block for print only (PRINT_ONLY) is read, as
+ * a screen applies none of it; one for other media may apply. The regex `/([^{}@]+)\{([^{}]*)\}/g`
+ * found the rules but not one left open nor one holding a block, and backtracked quadratically over a
+ * long stylesheet with no braces.
+ */
+function cssRules(css: string): CssRule[] {
+  const rules: CssRule[] = [];
+  type RuleBlock = CssRule & { own: number };
+  // The open blocks, innermost last: a style rule's (its own text resumes at `own`), or null for an at-rule's.
+  const blocks: (RuleBlock | null)[] = [];
+  let rulesOpen = 0;
+  let atRulesOpen = 0;
+  // How many blocks were open around the `@media print` block open, if one is: nothing in it is a rule a screen applies.
+  let printFrom = -1;
+  // The open brackets' closing characters, innermost last; where the outermost opened, and whether
+  // it is a dropped rule's block rather than a value's.
+  let closers = new Uint8Array(16);
+  let brackets = 0;
+  let bracketsFrom = 0;
+  let dropped = false;
+  const bracket = (close: number) => {
+    if (brackets === closers.length) {
+      const grown = new Uint8Array(brackets * 2);
+      grown.set(closers);
+      closers = grown;
+    }
+    closers[brackets++] = close;
+  };
+  // The bracketed text up to `end`, its semicolons blanked, or nothing for a dropped rule's block.
+  const bracketed = (end?: number) => (dropped ? "" : css.slice(bracketsFrom, end).replaceAll(";", " "));
+  // Where the prelude or declaration being read starts, and whether it is an at-rule's, once known.
+  let item = 0;
+  let atRule: boolean | undefined;
+  const isAtRule = () => {
+    if (atRule === undefined) {
+      const lead = blocks.length === 0 ? /(?:[\t\n\f\r ]|<!--|-->)*@/y : /[\t\n\f\r ]*@/y;
+      lead.lastIndex = item;
+      atRule = lead.test(css);
+    }
+    return atRule;
+  };
+  const next = (at: number) => {
+    item = at;
+    atRule = undefined;
+  };
+  const STRUCTURE = /[{}()[\];]/g;
+  for (let match = STRUCTURE.exec(css); match; match = STRUCTURE.exec(css)) {
+    const at = match.index;
+    const code = css.charCodeAt(at);
+    const top = blocks.at(-1);
+    if (brackets > 0) {
+      if (code === closers[brackets - 1]) {
+        if (--brackets > 0) continue;
+        if (top) {
+          top.declarations += css.slice(top.own, bracketsFrom) + bracketed(at + 1);
+          top.own = at + 1;
+        }
+        if (dropped) next(at + 1);
+      } else if (code === 40 || code === 91 || code === 123) {
+        bracket(code === 40 ? 41 : code === 91 ? 93 : 125);
+      }
+    } else if (code === 40 || code === 91) {
+      bracketsFrom = at;
+      dropped = false;
+      bracket(code === 40 ? 41 : 93);
+    } else if (code === 59) {
+      if (blocks.length > 0 || isAtRule()) next(at + 1);
+    } else if (code === 123) {
+      const selectors = isAtRule() ? undefined : css.slice(item, at).replace(blocks.length === 0 ? /^(?:[\t\n\f\r ]|<!--|-->)*/ : /^[\t\n\f\r ]*/, "");
+      if (selectors === "") {
+        bracketsFrom = item;
+        dropped = true;
+        bracket(125);
+        continue;
+      }
+      if (top) top.declarations += css.slice(top.own, item);
+      if (selectors === undefined) {
+        if (printFrom === -1 && PRINT_ONLY.test(css.slice(css.indexOf("@", item), at))) printFrom = blocks.length;
+        blocks.push(null);
+        atRulesOpen++;
+      } else {
+        const rule = { selectors, declarations: "", nested: rulesOpen > 0, conditional: atRulesOpen > 0, own: at + 1 };
+        if (printFrom === -1) rules.push(rule);
+        blocks.push(rule);
+        rulesOpen++;
+      }
+      next(at + 1);
+    } else if (code === 125 && blocks.length > 0) {
+      blocks.pop();
+      if (top) {
+        top.declarations += css.slice(top.own, at);
+        rulesOpen--;
+      } else {
+        atRulesOpen--;
+      }
+      if (blocks.length === printFrom) printFrom = -1;
+      const parent = blocks.at(-1);
+      if (parent) parent.own = at + 1;
+      next(at + 1);
+    }
+  }
+  // The innermost block left open runs to the end, a bracket left open in it too; those around it stopped where it began.
+  const top = blocks.at(-1);
+  if (top) top.declarations += brackets === 0 ? css.slice(top.own) : css.slice(top.own, bracketsFrom) + bracketed();
+  return rules;
+}
+
+/** A declaration's value, lower-cased, and whether it is `!important`. */
+type Declaration = { value: string; important: boolean };
+/** A block's declarations: those a browser keeps (`valid`), and those read only because they would hide (`hiding`). */
+type Declarations = { valid: Map<string, Declaration>; hiding: Map<string, Declaration> };
+
+/** Whitespace JavaScript's `\s` and `trim` take that CSS doesn't (a no-break space, U+3000, U+FEFF…): to CSS, part of a name. */
+const NOT_CSS_SPACE = /[^\S\t\n\f\r ]/;
+
+/** Text without the whitespace CSS has (tab, newline, form feed, carriage return, space) at either end. */
+function cssTrim(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && isCssWhitespace(text.charCodeAt(start))) start++;
+  while (end > start && isCssWhitespace(text.charCodeAt(end - 1))) end--;
+  return text.slice(start, end);
+}
+
+/**
+ * A declaration block's declarations of the properties the converter reads (READ_PROPERTIES), from a
+ * skeleton ({@link cssSkeleton}), as a browser reads them: split at semicolons outside brackets, with
+ * `!important` (CSS whitespace allowed after the `!`) read off the end, and names lower-cased in
+ * ASCII. One whose value every major browser accepts ({@link validValue}) is `valid`: of two for one
+ * property an important one wins, and otherwise the later. One that isn't is dropped, so it overrides
+ * nothing, unless it would hide its element ({@link hidingStrength}): then it is kept apart
+ * (`hiding`), read only where reading it can hide ({@link styleOf}), until a valid one at least as
+ * important comes after it; of two, the one that hides more surely. A value holding whitespace CSS
+ * doesn't have is never valid. `font` is read as the `font-size` it sets, and `background` as the
+ * `background-color`.
+ */
+function parseDeclarations(css: string, quirks: boolean): Declarations {
+  const valid = new Map<string, Declaration>();
+  const hiding = new Map<string, Declaration>();
+  const add = (text: string) => {
+    const colon = text.indexOf(":");
+    if (colon <= 0) return;
+    const property = asciiLowerCase(cssTrim(text.slice(0, colon)));
+    const read = property === "font" ? "font-size" : property === "background" ? "background-color" : property;
+    if (!READ_PROPERTIES.has(read)) return;
+    let value = asciiLowerCase(cssTrim(text.slice(colon + 1)));
+    const bang = /![\t\n\f\r ]*important$/.exec(value);
+    if (bang) value = cssTrim(value.slice(0, bang.index));
+    const important = bang !== null;
+    // A `!` anywhere else (`#000 !important !important`) is one a browser rejects the declaration for.
+    if (value.includes("!")) return;
+    const accepted = NOT_CSS_SPACE.test(value) ? undefined : validValue(property, value, quirks);
+    if (accepted !== undefined) {
+      // One after an important one loses to it.
+      if (valid.get(read)?.important && !important) return;
+      valid.set(read, { value: accepted, important });
+      if (important || !hiding.get(read)?.important) hiding.delete(read);
+    } else {
+      const strength = hidingStrength(read, value);
+      const held = hiding.get(read);
+      const heldStrength = held ? hidingStrength(read, held.value) : -1;
+      if (strength === 0 || heldStrength > strength || (heldStrength === strength && held!.important && !important)) return;
+      hiding.set(read, { value, important });
+    }
+  };
+  // The open brackets' closing characters, innermost last: a semicolon inside one ends nothing.
+  const closers: string[] = [];
+  let from = 0;
+  const STRUCTURE = /[()[\]{};]/g;
+  for (let match = STRUCTURE.exec(css); match; match = STRUCTURE.exec(css)) {
+    const char = match[0];
+    if (char === ";" && closers.length === 0) {
+      add(css.slice(from, match.index));
+      from = match.index + 1;
+    } else if (char === closers.at(-1)) {
+      closers.pop();
+    } else if (char === "(" || char === "[" || char === "{") {
+      closers.push(char === "(" ? ")" : char === "[" ? "]" : "}");
+    }
+  }
+  add(css.slice(from));
+  return { valid, hiding };
+}
+
+/** CSS's keywords that every property takes. */
+const CSS_WIDE = new Set(["inherit", "initial", "unset", "revert", "revert-layer"]);
+/** A CSS number: a sign, digits with a fraction or without, or a fraction alone, and an exponent. */
+const CSS_NUMBER = String.raw`[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:e[+-]?[0-9]+)?`;
+const NUMBER = new RegExp(`^${CSS_NUMBER}$`);
+/** A number with a length's unit, a percentage, or no unit. */
+const DIMENSION = new RegExp(`^(${CSS_NUMBER})(%|px|cm|mm|q|in|pt|pc|r?(?:em|ex|ch|ic|cap|lh)|[sld]?v(?:w|h|i|b|min|max)|cq(?:w|h|i|b|min|max))?$`);
+
+/** What a length property takes: negative values, percentages, its keywords, and the number of pixels at which it hides. */
+type LengthGrammar = { negative: boolean; keywords: ReadonlySet<string>; hides: (pixels: number) => boolean };
+const SIZE_KEYWORDS = ["min-content", "max-content", "fit-content"];
+const SIZE: LengthGrammar = { negative: false, keywords: new Set(["auto", ...SIZE_KEYWORDS]), hides: pixels => pixels <= MAX_CLIPPED_PX };
+const MAX_SIZE: LengthGrammar = { negative: false, keywords: new Set(["none", ...SIZE_KEYWORDS]), hides: pixels => pixels <= MAX_CLIPPED_PX };
+const OFFSET: LengthGrammar = { negative: true, keywords: new Set(["auto"]), hides: pixels => pixels <= OFF_SCREEN_PX };
+const FONT_SIZE: LengthGrammar = {
+  negative: false,
+  keywords: new Set(["xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large", "smaller", "larger"]),
+  hides: pixels => pixels <= MAX_HIDDEN_FONT_PX,
+};
+const LENGTHS: ReadonlyMap<string, LengthGrammar> = new Map([
+  ["width", SIZE], ["height", SIZE], ["max-width", MAX_SIZE], ["max-height", MAX_SIZE],
+  ["left", OFFSET], ["top", OFFSET], ["right", OFFSET], ["bottom", OFFSET], ["margin-left", OFFSET], ["margin-top", OFFSET],
+  ["text-indent", { negative: true, keywords: new Set(), hides: pixels => pixels <= OFF_SCREEN_PX }],
+  ["letter-spacing", { negative: true, keywords: new Set(["normal"]), hides: pixels => pixels <= COLLAPSED_SPACING_PX }],
+  ["font-size", FONT_SIZE],
+]);
+
+/**
+ * A length a browser accepts. With no unit, a number is a length when it is zero, or in quirks mode,
+ * where a browser reads a message with no doctype. A doctype can leave a browser in quirks mode too,
+ * so with one, a number with no unit is read where it would hide, and not where it would show. So is
+ * a length in a unit not every major browser has had for long (`rcap`, `rch`, `rex`, `ric`).
+ */
+function lengthValue(value: string, grammar: LengthGrammar, quirks: boolean): string | undefined {
+  if (grammar.keywords.has(value)) return value;
+  const match = DIMENSION.exec(value);
+  if (!match) return undefined;
+  const number = Number(match[1]);
+  if (number < 0 && !grammar.negative) return undefined;
+  const unsure = match[2] === undefined ? !quirks : /^r(?:cap|ch|ex|ic)$/.test(match[2]);
+  if (unsure && number !== 0 && !grammar.hides(cssLength(value) ?? Number.POSITIVE_INFINITY)) return undefined;
+  return value;
+}
+
+/** `display`'s keywords every major browser accepts alone (not `math`, `ruby` or `ruby-text`). */
+const DISPLAY = new Set([
+  "none", "contents", "block", "inline", "flow", "flow-root", "table", "flex", "grid", "list-item", "inline-block", "inline-table",
+  "inline-flex", "inline-grid", "table-row-group", "table-header-group", "table-footer-group", "table-row", "table-cell", "table-column-group",
+  "table-column", "table-caption", "-webkit-box", "-webkit-inline-box", "-webkit-flex", "-webkit-inline-flex",
+]);
+const DISPLAY_OUTSIDE = new Set(["block", "inline"]);
+const DISPLAY_INSIDE = new Set(["flow", "flow-root", "table", "flex", "grid"]);
+
+/** A `display` every major browser accepts: one keyword, or an outer and an inner one (`block flow`), but not with `list-item`. */
+function displayValue(value: string): string | undefined {
+  if (DISPLAY.has(value)) return value;
+  const [first = "", second = "", ...rest] = value.split(/\s+/);
+  return rest.length === 0 && ((DISPLAY_OUTSIDE.has(first) && DISPLAY_INSIDE.has(second)) || (DISPLAY_INSIDE.has(first) && DISPLAY_OUTSIDE.has(second)))
+    ? value : undefined;
+}
+
+const FONT_STRETCH = new Set(["ultra-condensed", "extra-condensed", "condensed", "semi-condensed", "semi-expanded", "expanded", "extra-expanded", "ultra-expanded"]);
+const SYSTEM_FONTS = new Set(["caption", "icon", "menu", "message-box", "small-caption", "status-bar"]);
+const GENERIC_FAMILIES = new Set(["serif", "sans-serif", "cursive", "fantasy", "monospace", "system-ui", "emoji", "math", "fangsong", "ui-serif", "ui-sans-serif",
+  "ui-monospace", "ui-rounded", "-webkit-body", "-webkit-pictograph", "-moz-fixed"]);
+const FAMILY_WORD = /^(?:--|-?[a-z_\u0080-\uffff])[\w\u0080-\uffff-]*$/;
+const ANGLE = new RegExp(`^(${CSS_NUMBER})(deg|grad|rad|turn)$`);
+const DEGREES: Readonly<Record<string, number>> = { deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 };
+const OPACITY = new RegExp(`^${CSS_NUMBER}%?$`);
+const OVERFLOW = new Set(["visible", "hidden", "clip", "scroll", "auto"]);
+
+/**
+ * The `font-size` a `font` shorthand sets, if a browser accepts it: up to four style, variant, weight
+ * and stretch keywords (`normal` for any), `oblique` with an angle of at most 90 degrees either way
+ * (a grad counted as a degree), then the size, with no unit only when zero, then `/` and a line
+ * height, then families. A shorthand that sets a size small enough to hide text is read however its
+ * angle and families are written, since reading it hides more, never less.
+ */
+function fontShorthandSize(value: string): string | undefined {
+  if (CSS_WIDE.has(value)) return value;
+  if (SYSTEM_FONTS.has(value)) return "medium";
+  const words = value.match(/[^\s/,]+|[/,]/g) ?? [];
+  const seen = new Set<string>();
+  let bounded = true;
+  let at = 0;
+  for (; at < words.length && seen.size < 4; at++) {
+    const word = words[at]!;
+    const kind = word === "normal" ? `normal${at}` : word === "italic" || word === "oblique" ? "style" : word === "small-caps" ? "variant"
+      : word === "bold" || word === "bolder" || word === "lighter" || (NUMBER.test(word) && Number(word) >= 1 && Number(word) <= 1000) ? "weight"
+        : FONT_STRETCH.has(word) ? "stretch" : undefined;
+    if (kind === undefined) break;
+    if (seen.has(kind)) return undefined;
+    seen.add(kind);
+    const angle = word === "oblique" ? ANGLE.exec(words[at + 1] ?? "") : null;
+    if (angle) {
+      bounded = Math.abs(Number(angle[1])) * Math.max(1, DEGREES[angle[2]!]!) <= 90;
+      at++;
+    }
+  }
+  const size = words[at];
+  if (size === undefined || lengthValue(size, FONT_SIZE, false) === undefined) return undefined;
+  if ((cssLength(size) ?? Infinity) <= MAX_HIDDEN_FONT_PX) return size;
+  if (!bounded) return undefined;
+  let family = at + 1;
+  if (words[family] === "/") {
+    const height = words[family + 1] ?? "";
+    if (height !== "normal" && !(DIMENSION.test(height) && !height.startsWith("-"))) return undefined;
+    family += 2;
+  }
+  // Families: comma-separated, each a string alone or names, none a reserved word; a generic one alone.
+  const entries = words.slice(family).join(" ").split(",").map(entry => entry.trim().split(" "));
+  const valid = family < words.length && entries.every(entry => entry[0] === "\"\"" ? entry.length === 1 : entry.every(word => FAMILY_WORD.test(word)
+    && !CSS_WIDE.has(word) && word !== "default" && (entry.length === 1 || !GENERIC_FAMILIES.has(word))));
+  return valid ? size : undefined;
+}
+
+/** A colour a browser accepts, as far as `parseColor` reads them; a hex colour needs its `#` but in quirks mode. */
+const colorValue = (value: string, quirks: boolean) =>
+  value === "currentcolor" || (parseColor(value) !== undefined && (value.startsWith("#") || !/^[0-9a-f]+$/.test(value) || (quirks && (value.length === 3 || value.length === 6))))
+    ? value : undefined;
+
+/** Keyword sets of the properties read as keywords. */
+const KEYWORDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["visibility", new Set(["visible", "hidden", "collapse"])],
+  ["position", new Set(["static", "relative", "absolute", "fixed", "sticky"])],
+  ["overflow-x", OVERFLOW],
+  ["overflow-y", OVERFLOW],
+]);
+
+/**
+ * A declaration's value as it is read, if every major browser has long accepted it for the property:
+ * a keyword every property takes; `display`'s keywords, one or two; a keyword of `visibility`,
+ * `position` and `overflow`; `opacity` as a number or percentage; lengths (in {@link lengthValue});
+ * the size of a `font` shorthand; a colour, and the one a `background` shorthand sets; `none` for a
+ * `transform` or `clip-path`, `auto` for a `clip`; Word's `mso-list`. Anything else, `var()` and
+ * maths functions such as `calc()` included, is not read, so it overrides nothing ({@link
+ * parseDeclarations} still reads one that would hide). Before, other properties' values were read as
+ * written, so `transform: scale(red) !important` overrode a later `transform: scale(0)`.
+ */
+function validValue(property: string, value: string, quirks: boolean): string | undefined {
+  if (value === "") return undefined;
+  if (CSS_WIDE.has(value)) return value;
+  const length = LENGTHS.get(property);
+  // Chrome reads a percentage in letter spacing only since version 145.
+  if (property === "letter-spacing" && value.endsWith("%")) return undefined;
+  if (length) return lengthValue(value, length, quirks);
+  const keywords = KEYWORDS.get(property);
+  if (keywords) return keywords.has(value) ? value : undefined;
+  switch (property) {
+    case "display": return displayValue(value);
+    case "opacity": return OPACITY.test(value) ? value : undefined;
+    case "overflow": {
+      const words = value.split(/\s+/);
+      return words.length <= 2 && words.every(word => OVERFLOW.has(word)) ? value : undefined;
+    }
+    case "font": return fontShorthandSize(value);
+    case "color": case "background-color": return colorValue(value, quirks);
+    case "background": return backgroundValue(value);
+    case "transform": case "clip-path": return value === "none" ? value : undefined;
+    case "clip": return value === "auto" ? value : undefined;
+    case "mso-list": return value;
+    default: return undefined;
+  }
+}
+
+const POSITION_X = new Set(["left", "center", "right"]);
+const POSITION_Y = new Set(["top", "center", "bottom"]);
+const POSITION: LengthGrammar = { negative: true, keywords: new Set(), hides: () => false };
+const BACKGROUND_SIZE: LengthGrammar = { negative: false, keywords: new Set(["auto"]), hides: () => false };
+const BACKGROUND_WORDS: ReadonlyMap<string, string> = new Map([
+  ...["repeat-x", "repeat-y", "repeat", "space", "round", "no-repeat"].map(word => [word, "repeat"] as const),
+  ...["scroll", "fixed", "local"].map(word => [word, "attachment"] as const),
+  ...["border-box", "padding-box", "content-box"].map(word => [word, "box"] as const),
+  ["none", "image"],
+]);
+
+/**
+ * The colour a `background` shorthand sets, `transparent` when it sets none, if it is one layer that
+ * every major browser accepts and is read here: a colour, an image (`none` or a `url()`), a repeat,
+ * an attachment, up to two boxes, and a position of one or two values with a size after a `/`.
+ * Another (a gradient, several layers, a three-value position) is not read, so it overrides nothing.
+ */
+function backgroundValue(value: string): string | undefined {
+  const tokens = value.match(/[a-z-]+\([^()]*\)|[^\s/()]+|[/()]/g) ?? [];
+  const isLength = (token: string | undefined, grammar: LengthGrammar) => token !== undefined && lengthValue(token, grammar, false) !== undefined;
+  const isPosition = (token: string | undefined, axis: ReadonlySet<string>) => token !== undefined && (axis.has(token) || isLength(token, POSITION));
+  const seen = new Map<string, number>();
+  let color = "transparent";
+  for (let at = 0; at < tokens.length; at++) {
+    const token = tokens[at]!;
+    let kind = BACKGROUND_WORDS.get(token) ?? (/^url\(\s*(?:"")?\s*\)$/.test(token) ? "image" : undefined);
+    if (kind === "repeat" && !token.startsWith("repeat-") && /^(?:repeat|space|round|no-repeat)$/.test(tokens[at + 1] ?? "")) {
+      at++;
+    } else if (kind === undefined && (isPosition(token, POSITION_X) || isPosition(token, POSITION_Y))) {
+      kind = "position";
+      const next = tokens[at + 1];
+      if ((isPosition(token, POSITION_X) && isPosition(next, POSITION_Y)) || (POSITION_Y.has(token) && POSITION_X.has(next ?? ""))) at++;
+      if (tokens[at + 1] === "/") {
+        at += 2;
+        if (tokens[at] !== "cover" && tokens[at] !== "contain") {
+          if (!isLength(tokens[at], BACKGROUND_SIZE)) return undefined;
+          if (isLength(tokens[at + 1], BACKGROUND_SIZE)) at++;
+        }
+      }
+    } else if (kind === undefined && colorValue(token, false) !== undefined) {
+      kind = "color";
+      color = token;
+    }
+    const count = (seen.get(kind ?? "") ?? 0) + 1;
+    if (kind === undefined || count > (kind === "box" ? 2 : 1)) return undefined;
+    seen.set(kind, count);
+  }
+  return tokens.length > 0 ? color : undefined;
+}
+
+/**
+ * What a message's own <style> blocks say about its elements, which inline styles alone would miss:
+ * hiding (`.preheader { display: none }`), and the colours and sizes that decide whether text shows.
+ * Hiding may be read loosely, but showing only where a rule certainly applies. So a rule is kept two
+ * ways. Where a browser certainly applies it as read (`proven`): one compound of a type, classes,
+ * IDs and attribute tests, in no at-rule and not nested, in a selector list a browser can't drop.
+ * And loosely, by its last compound's classes, IDs or else type, as a browser may apply it
+ * (`loose`, `pin`): there a hiding selector's last compound decides, so `table td.x` hides every
+ * `.x`, and colours and sizes come only from single-compound selectors (`.x`, `td.x`), since
+ * `.header a { color: #fff }` says nothing about the links elsewhere.
+ */
+export type StyleRules = {
+  /** Rules certainly applied as read, by their compound's first ID, else class, else type, else `*`: `#id`, `.class`, `td`, `*`. */
+  proven: Map<string, Proven[]>;
+  /** For each key, as {@link styleOf} reads them: the values that may hide, and the colours and sizes of rules not proven. */
+  loose: Map<string, Map<string, Candidate>>;
+  /** For each key, the last value of each property its rules set, as the reader before this one read them ({@link pinStylesheetRules}). */
+  pin: Map<string, Map<string, string>>;
+  /** Attributes whose presence a hiding rule selects on (`[data-preheader]`). */
+  hiddenAttributes: Set<string>;
+  /** Whether the message is read in quirks mode, as a browser reads one with no doctype. */
+  quirks: boolean;
+};
+
+/** A declaration's value and its weight in the cascade ({@link weigh}). */
+type Weighted = { value: string; weight: number };
+/** A declaration that may apply, and how surely it hides ({@link hidingStrength}; colours and sizes count 1). */
+type Candidate = Weighted & { strength: number };
+/** A compound's classes, IDs, and attributes or their values. */
+type Tests = { classes: string[]; ids: string[]; attributes: [name: string, value?: string][] };
+/**
+ * A rule a browser certainly applies to an element its compound matches: its type and its tests, as
+ * written and folded to lower case in ASCII, and its declarations, with those that may hide where it
+ * matches only ignoring case ({@link candidate}).
+ */
+type Proven = { tag?: string; tests: Tests; folded: Tests; declarations: ReadonlyMap<string, Weighted>; candidates: ReadonlyMap<string, Candidate> };
+
+/** A specificity above any selector's: an element's own `style` attribute. */
+const INLINE_SPECIFICITY = 2 ** 24;
+/**
+ * A declaration's place in the cascade as one number, so the highest wins: importance first, then
+ * specificity (a `style` attribute's above any selector's), then source order.
+ */
+const weigh = (important: boolean, specificity: number, order: number) => (important ? 2 ** 50 : 0) + specificity * 2 ** 24 + order;
+
+/** A selector's parts as specificity counts them: attribute tests, pseudo-classes and pseudo-elements, IDs, classes and types. */
+const SPECIFICITY_PARTS = /\[[^\]]*\]?|::?[\w\u0080-\uffff-]*|[#.]?[\w\u0080-\uffff-]+/g;
+
+/**
+ * A selector's specificity as one number: IDs, then classes, attribute tests and pseudo-classes, then
+ * types and pseudo-elements, each counted up to 255. A pseudo-class's argument is counted as part of
+ * the selector, which is more than `:where()`, `:not()` or `:nth-child()` add.
+ */
+function specificity(selector: string): number {
+  let ids = 0;
+  let classes = 0;
+  let types = 0;
+  for (const [part] of selector.matchAll(SPECIFICITY_PARTS)) {
+    if (part[0] === "#") ids++;
+    else if (part.startsWith("::")) types++;
+    else if (part[0] === "." || part[0] === "[" || part[0] === ":") classes++;
+    else if (!/^[0-9-]/.test(part)) types++;
+  }
+  return Math.min(ids, 255) * 65_536 + Math.min(classes, 255) * 256 + Math.min(types, 255);
+}
+
+/** The declarations text inherits, the only ones taken from `html` and `body` rules: hiding those would hide the message. */
+const INHERITED_PROPERTIES = new Set(["color", "background-color", "font-size"]);
+const isPage = (key: string) => key === "html" || key === "body";
+/** The declarations that decide whether text shows by what is around it, not by hiding its element. */
+const TEXT_PROPERTIES = new Set([...INHERITED_PROPERTIES, "mso-list"]);
+
+/**
+ * Every property the converter reads from an element's style; a stylesheet's other declarations are
+ * dropped as it is read. Kept, they were copied for every selector in a rule and every element a
+ * rule matched, so a long rule over many elements cost their product. A property read from a style
+ * must be listed here.
+ */
+const READ_PROPERTIES = new Set([
+  "display", "visibility", "mso-hide", "content-visibility", "opacity", "overflow", "overflow-x", "overflow-y",
+  "max-height", "height", "max-width", "width", "position", "left", "top", "right", "bottom", "margin-left", "margin-top",
+  "text-indent", "letter-spacing", "clip", "clip-path", "transform", "scale", "filter", ...TEXT_PROPERTIES,
+]);
+
+/** What a declaration needs beside it to hide where it doesn't alone: a small box clips only with `overflow`, an offset moves only a positioned box. */
+const HIDING_PARTNERS = new Map<string, readonly [string, string]>([
+  ...["overflow", "overflow-x", "overflow-y"].map(property => [property, ["height", "1px"]] as const),
+  ...["height", "width", "max-height", "max-width"].map(property => [property, ["overflow", "hidden"]] as const),
+  ["position", ["left", "-9999px"]],
+  ...["left", "top", "right", "bottom"].map(property => [property, ["position", "absolute"]] as const),
+]);
+
+/** How surely a declaration hides its element: 2 alone, 1 beside its partner ({@link HIDING_PARTNERS}), 0 not at all. */
+function hidingStrength(property: string, value: string): number {
+  if (hidesElement(new Map([[property, value]]))) return 2;
+  const partner = HIDING_PARTNERS.get(property);
+  return partner && hidesElement(new Map([[property, value], partner])) ? 1 : 0;
+}
+
+/** A declaration that may apply, unless it can't hide: colours and sizes, which hide by what is around them, always may. */
+function candidate(property: string, value: string, weight: number): Candidate | undefined {
+  const strength = TEXT_PROPERTIES.has(property) ? 1 : hidingStrength(property, value);
+  return strength > 0 ? { value, weight, strength } : undefined;
+}
+
+/**
+ * Keeps, of the declarations that may apply for a property, the one most sure to hide, at the
+ * highest weight any of them has: so one that doesn't hide is never kept, and one that hides is
+ * read as winning wherever any of them could. Of colours and sizes, the highest-weighted.
+ */
+function keep(into: Map<string, Candidate>, property: string, next: Candidate | undefined): void {
+  const held = into.get(property);
+  if (!next || (held && held.strength >= next.strength && held.weight >= next.weight)) return;
+  into.set(property, !held || next.strength > held.strength || next.weight > held.weight
+    ? { ...next, weight: Math.max(next.weight, held?.weight ?? -1) } : held);
+}
+
+/**
+ * The longest value of a rule read as written. A rule's values are read at every element it applies
+ * to, so a long one (`color: rgb(255 255 255 …)`, padded) over many elements cost their product. A
+ * rule with a longer one hides what it may apply to, unread: no mail writes one so long.
+ */
+const MAX_RULE_VALUE_CHARS = 256;
+/** A property no declaration sets: one too long to read sets it in `pin` ({@link pinStylesheetRules}), and it hides ({@link pinHides}). */
+const UNREAD = "unread value";
+
+/** CSS's whitespace, for a pattern: not JavaScript's `\s`, which takes a no-break space that CSS reads as part of a name. */
+const CSS_SPACE = String.raw`[\t\n\f\r ]`;
+
+/**
+ * A selector list's member as a browser reads it: compounds of a type or `*`, classes, IDs, attribute
+ * tests and pseudo-classes, joined by combinators. Linear: each part starts with its own character.
+ */
+const CSS_NAME = String.raw`[\w\u0080-\uffff-]+`;
+const SUBCLASS = String.raw`(?:[.#]${CSS_NAME}|\[[^\]]*\]|::?${CSS_NAME}(?:\([^)]*\))?)`;
+const COMPOUND = String.raw`(?:(?:${CSS_NAME}|\*)${SUBCLASS}*|${SUBCLASS}+)`;
+const READABLE_SELECTOR = new RegExp(String.raw`^${COMPOUND}(?:${CSS_SPACE}*[>+~]${CSS_SPACE}*${COMPOUND}|${CSS_SPACE}+${COMPOUND})*$`, "i");
+
+/**
+ * A selector list's member every browser accepts as read: compounds of a type or `*`, classes, IDs and
+ * attribute tests (no pseudo-classes, and names CSS allows), joined by combinators.
+ */
+const IDENT = String.raw`(?:--|-?[a-z_\u0080-\uffff])[\w\u0080-\uffff-]*`;
+const ATTRIBUTE = String.raw`\[${CSS_SPACE}*${IDENT}${CSS_SPACE}*(?:[~|^$*]?=${CSS_SPACE}*(?:${IDENT}|"")${CSS_SPACE}*(?:i${CSS_SPACE}*)?)?\]`;
+const PLAIN_COMPOUND = String.raw`(?:(?:${IDENT}|\*)(?:[.#]${IDENT}|${ATTRIBUTE})*|(?:[.#]${IDENT}|${ATTRIBUTE})+)`;
+const PLAIN_SELECTOR = new RegExp(String.raw`^${CSS_SPACE}*${PLAIN_COMPOUND}(?:${CSS_SPACE}*[>+~]${CSS_SPACE}*${PLAIN_COMPOUND}|${CSS_SPACE}+${PLAIN_COMPOUND})*${CSS_SPACE}*$`, "i");
+/** A plain compound's parts: its type or `*`, a class or ID, an attribute or its exact value, or anything else, which isn't proven. */
+const COMPOUND_PART = new RegExp(String.raw`^(${IDENT}|\*)|([.#])(${IDENT})|\[${CSS_SPACE}*(${IDENT})${CSS_SPACE}*(?:=${CSS_SPACE}*(${IDENT})${CSS_SPACE}*)?\]|([^])`, "gi");
+/** The most proven rules kept for one key; past that, a rule is read loosely, so the work an element costs is bounded. */
+const MAX_PROVEN_RULES = 32;
+
+/** The most classes, IDs and attribute tests a proven compound has; past that (`.x.x.x…`), matching it could cost more than its length. */
+const MAX_COMPOUND_TESTS = 16;
+
+/**
+ * A plain compound as a proven rule, and the key it is found by, unless it has a part not proven
+ * (`[a^=b]`) or too many. Its tests are folded here, once: folded at every element they were tested
+ * on, a long class or value cost its length there, so a long rule over many elements cost their
+ * product. Of an `html` or `body` rule, only what text inherits is kept.
+ */
+function provenRule(compound: string, declarations: ReadonlyMap<string, Weighted>): { key: string; rule: Proven } | undefined {
+  const tests: Tests = { classes: [], ids: [], attributes: [] };
+  let type: string | undefined;
+  for (const [, tag, sigil, name, attribute, value, other] of compound.matchAll(COMPOUND_PART)) {
+    if (other !== undefined) return undefined;
+    if (tag === "*") continue;
+    if (tag !== undefined) type = asciiLowerCase(tag);
+    else if (sigil === ".") tests.classes.push(name!);
+    else if (sigil === "#") tests.ids.push(name!);
+    else tests.attributes.push([asciiLowerCase(attribute!), value]);
+    if (tests.classes.length + tests.ids.length + tests.attributes.length > MAX_COMPOUND_TESTS) return undefined;
+  }
+  const folded: Tests = {
+    classes: tests.classes.map(asciiLowerCase),
+    ids: tests.ids.map(asciiLowerCase),
+    attributes: tests.attributes.map(([name, value]) => [name, value === undefined ? undefined : asciiLowerCase(value)]),
+  };
+  const key = folded.ids[0] !== undefined ? `#${folded.ids[0]}` : folded.classes[0] !== undefined ? `.${folded.classes[0]}` : type ?? "*";
+  const kept = isPage(key) ? new Map([...declarations].filter(([property]) => INHERITED_PROPERTIES.has(property))) : declarations;
+  const candidates = new Map<string, Candidate>();
+  for (const [property, { value, weight }] of kept) keep(candidates, property, candidate(property, value, weight));
+  return { key, rule: { tag: type, tests, folded, declarations: kept, candidates } };
+}
+
+/**
+ * The keys a rule is read under for a compound selector (`loose`, `pin`): its classes and IDs, else,
+ * if it tests no attribute, its type or `*`; and the attributes it tests. A value test (`=`, `^=`,
+ * `*=`…) is read as "has the attribute", hiding at least as much. `legacy`, its attributes are those
+ * the reader before this one read ({@link pinAttributes}).
+ */
+function keysOf(compound: string, legacy = false): { keys: string[]; attributes: string[] } {
+  const keys = [...compound.matchAll(/([.#])([a-z0-9_-]+)/gi)].map(([, sigil, name]) => sigil! + name!.toLowerCase());
+  const attributes = (legacy ? pinAttributes(compound) : selectedAttributes(compound)).map(name => name.toLowerCase());
+  const tag = /^([a-z][a-z0-9]*|\*)/i.exec(compound)?.[1]?.toLowerCase();
+  if (keys.length === 0 && attributes.length === 0 && tag !== undefined) keys.push(tag);
+  return { keys, attributes };
+}
+
+/**
+ * Declarations as the reader before this one read them: split at every semicolon, trimmed and
+ * lower-cased as JavaScript does, `!important` dropped wherever it stands, the last of a property
+ * winning, and `background` read as its first word that is a colour. Only what the converter reads
+ * is kept (READ_PROPERTIES).
+ */
+function pinDeclarations(css: string): Map<string, string> {
+  const declarations = new Map<string, string>();
+  for (const declaration of css.split(";")) {
+    const colon = declaration.indexOf(":");
+    if (colon <= 0) continue;
+    const name = declaration.slice(0, colon).trim().toLowerCase();
+    if (!READ_PROPERTIES.has(name) && name !== "background") continue;
+    const value = declaration.slice(colon + 1).replace(/!important/i, "").trim().toLowerCase();
+    declarations.set(name, name === "background" ? value.split(/\s+/).find(part => parseColor(part, true) !== undefined) ?? "" : value);
+  }
+  return declarations;
+}
+
+/**
+ * The attributes the reader before this one read a compound selector as testing, by
+ * `/\[\s*([a-z0-9_:-]+)\s*(?:[~|^$*]?=\s*["']?[^"'\]]*["']?\s*)?\]/gi`, in one pass: that searched
+ * the rest again from every `[` with a name and `=` after it. The compounds it read held no
+ * whitespace, so a test is a name, and either its `]` or an `=` (`|=`, `^=`…) and a value that holds
+ * a quote only at either end, to the first `]`. Whether it finds one decides whether a rule is read
+ * for the compound's type.
+ */
+function pinAttributes(compound: string): string[] {
+  const names: string[] = [];
+  const name = /[a-z0-9_:-]+/iy;
+  let close = -1;
+  // The last three quotes before `close`: with more, a value holds one inside.
+  let quotes: number[] = [];
+  for (let open = compound.indexOf("["); open !== -1; open = compound.indexOf("[", open + 1)) {
+    if (open > close) {
+      close = compound.indexOf("]", open);
+      if (close === -1) break;
+      quotes = [];
+      for (let at = close - 1; at > open && quotes.length < 3; at--) if (compound[at] === "\"" || compound[at] === "'") quotes.unshift(at);
+    }
+    name.lastIndex = open + 1;
+    const read = name.exec(compound)?.[0];
+    if (read === undefined) continue;
+    let value = name.lastIndex;
+    if (value !== close) {
+      value += "~|^$*".includes(compound[value]!) ? 1 : 0;
+      if (compound[value] !== "=") continue;
+      const inside = quotes.filter(at => at > value);
+      if (inside.length > 2 || (inside.length === 2 && (inside[0] !== value + 1 || inside[1] !== close - 1))
+        || (inside.length === 1 && inside[0] !== value + 1 && inside[0] !== close - 1)) continue;
+    }
+    names.push(read);
+    open = close;
+  }
+  return names;
+}
+
+/** CSS without its comments, as `replace(/\/\*[\s\S]*?\*\//g, "")` left it, in one pass: from an unclosed one on, nothing is removed. */
+function withoutComments(css: string): string {
+  let kept = "";
+  let from = 0;
+  for (let open = css.indexOf("/*"); open !== -1; open = css.indexOf("/*", from)) {
+    const close = css.indexOf("*/", open + 2);
+    if (close === -1) break;
+    kept += css.slice(from, open);
+    from = close + 2;
+  }
+  return kept + css.slice(from);
+}
+
+/**
+ * A stylesheet's rules as the reader before this one found them: each innermost `{…}` block, its
+ * selectors whatever follows the last `}` or `@` before it, so a rule in `@media print` is one.
+ */
+function pinCssRules(css: string): Pick<CssRule, "selectors" | "declarations">[] {
+  const rules: Pick<CssRule, "selectors" | "declarations">[] = [];
   let from = 0;
   let close = -1;
   for (let open = css.indexOf("{"); open !== -1;) {
@@ -142,79 +1070,380 @@ function cssRules(css: string): { selectors: string; declarations: string }[] {
   return rules;
 }
 
-function parseDeclarations(css: string): Map<string, string> {
-  const declarations = new Map<string, string>();
-  for (const declaration of css.split(";")) {
-    const colon = declaration.indexOf(":");
-    if (colon > 0) declarations.set(declaration.slice(0, colon).trim().toLowerCase(), declaration.slice(colon + 1).replace(/!important/i, "").trim().toLowerCase());
-  }
-  return declarations;
-}
-
 /**
- * What a message's own <style> blocks say about its elements, which inline styles alone would miss:
- * hiding (`.preheader { display: none }`), and the colours and sizes that decide whether text shows.
- * A hiding selector's last compound decides, ignoring what comes before it, so `table td.x` hides
- * every `.x`: reading more hides more than the rule does, never less. Colours and sizes come only
- * from single-compound selectors (`.x`, `td.x`), since `.header a { color: #fff }` says nothing
- * about the links elsewhere.
+ * `pin`, and the attributes it hides, as the reader before this one read them from a message's
+ * markup: every `<style>…</style>` in it, wherever it stands (a comment, a template, an attribute),
+ * without its comments; every rule ({@link pinCssRules}); each selector's compounds split at `\s`,
+ * `>`, `+` and `~`, one of more than one read only where the rule hides; and no `*` rule. Found by
+ * `/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi`, read here in one pass. Whether a rule hides is its own
+ * test ({@link pinHides}). A rule with a value longer than MAX_RULE_VALUE_CHARS is read as hiding,
+ * as {@link stylesheetRules} reads one: it sets UNREAD, and none of its values.
  */
-export type StyleRules = {
-  classes: Map<string, Map<string, string>>;
-  ids: Map<string, Map<string, string>>;
-  tags: Map<string, Map<string, string>>;
-  /** Attributes whose presence a hiding rule selects on (`[data-preheader]`). */
-  hiddenAttributes: Set<string>;
-};
-
-/** The declarations text inherits, the only ones taken from `html` and `body` rules: hiding those would hide the message. */
-const INHERITED_PROPERTIES = new Set(["color", "background", "background-color", "font-size"]);
-
-function stylesheetRules(html: string): StyleRules {
-  const rules: StyleRules = { classes: new Map(), ids: new Map(), tags: new Map(), hiddenAttributes: new Set() };
-  const merge = (into: Map<string, Map<string, string>>, key: string, declarations: ReadonlyMap<string, string>) => {
-    const merged = into.get(key) ?? new Map<string, string>();
-    for (const [property, value] of declarations) merged.set(property, value);
-    into.set(key, merged);
-  };
-  for (const block of html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi)) {
-    for (const rule of cssRules(block[1]!.replace(/\/\*[\s\S]*?\*\//g, ""))) {
-      const declarations = parseDeclarations(rule.declarations);
-      const hides = hidesElement(declarations);
+function pinStylesheetRules(html: string, rules: StyleRules): void {
+  const open = /<style\b/gi;
+  const close = /<\/style\s*>/gi;
+  for (let start = open.exec(html); start !== null; start = open.exec(html)) {
+    const content = html.indexOf(">", start.index) + 1;
+    if (content === 0) break;
+    close.lastIndex = content;
+    const end = close.exec(html);
+    if (end === null) break;
+    open.lastIndex = close.lastIndex;
+    for (const rule of pinCssRules(withoutComments(html.slice(content, end.index)))) {
+      const declarations = pinDeclarations(rule.declarations);
+      const long = [...declarations.values()].some(value => value.length > MAX_RULE_VALUE_CHARS);
+      const hides = long || pinHides(declarations);
       for (const selector of rule.selectors.split(",")) {
         const compounds = selector.trim().split(/[\s>+~]+/);
         if (!hides && compounds.length > 1) continue;
+        const { keys, attributes } = keysOf(withoutPseudoClasses(compounds.at(-1) ?? ""), true);
+        if (hides) for (const name of attributes) rules.hiddenAttributes.add(name);
+        for (const key of keys) {
+          if (key === "*") continue;
+          let pinned = rules.pin.get(key);
+          if (!pinned) rules.pin.set(key, pinned = new Map());
+          if (long) pinned.set(UNREAD, "");
+          else for (const [property, value] of declarations) if (!isPage(key) || INHERITED_PROPERTIES.has(property) || property === "background") pinned.set(property, value);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Each rule of a message's stylesheets, kept as {@link StyleRules} says. A rule's weight in the
+ * cascade ({@link weigh}) counts its whole selector, more parts than a browser counts, never fewer.
+ * Before, every rule was read loosely, so `p.x { display: block }` showed a `div.x` that `.x` hid,
+ * and so did a rule in `@media print`. Of a sheet a browser may not apply ({@link Sheet}), only what
+ * would hide is read: none of its rules is proven, and its colours and sizes take no other's place.
+ * `pin` and what it hides are read from the message's markup as the reader before this one read them
+ * ({@link pinStylesheetRules}).
+ */
+function stylesheetRules(sheets: readonly Sheet[], html: string, quirks: boolean): StyleRules {
+  const rules: StyleRules = { proven: new Map(), loose: new Map(), pin: new Map(), hiddenAttributes: new Set(), quirks };
+  const entries = <T>(map: Map<string, Map<string, T>>, key: string) => {
+    let entry = map.get(key);
+    if (!entry) map.set(key, entry = new Map());
+    return entry;
+  };
+  pinStylesheetRules(html, rules);
+  let order = 0;
+  for (const { css, hidingOnly } of sheets) {
+    for (const rule of cssRules(cssSkeleton(css))) {
+      order++;
+      const { valid, hiding } = parseDeclarations(rule.declarations, quirks);
+      // A browser's declarations (`sure`), then those read only because they would hide; each with how surely it hides.
+      const declared = [...valid, ...hiding].map(([property, { value, important }], at) =>
+        ({ property, value, important, sure: at < valid.size, strength: TEXT_PROPERTIES.has(property) ? 1 : hidingStrength(property, value) }));
+      if (declared.length === 0) continue;
+      const long = declared.some(({ value }) => value.length > MAX_RULE_VALUE_CHARS);
+      const styleFrom = (from: typeof declared) => new Map(from.map(({ property, value }) => [property, value]));
+      const hides = long || hidesElement(styleFrom(declared.slice(0, valid.size))) || hidesElement(styleFrom(declared));
+      const selectors = rule.selectors.split(",");
+      // A rule's colours and sizes are read loosely only where a browser may apply it: one nested in
+      // another rule applies only inside that rule's elements, and a browser drops one with a selector
+      // it can't read. Read anyway, a hiding rule hides more.
+      const readable = hides || (!rule.nested && selectors.every(selector => READABLE_SELECTOR.test(cssTrim(selector))));
+      const plain = !long && !hidingOnly && !rule.nested && !rule.conditional && selectors.every(selector => PLAIN_SELECTOR.test(selector));
+      for (const selector of selectors) {
+        const compounds = compoundsOf(cssTrim(selector));
         // The last compound, without pseudo-classes: `div > p.x:first-child` → `p.x`.
-        const last = compounds.at(-1)?.replace(/::?[a-z-]+(\([^)]*\))?/gi, "") ?? "";
-        let matched = false;
-        for (const part of last.matchAll(/([.#])([a-z0-9_-]+)/gi)) {
-          merge(part[1] === "." ? rules.classes : rules.ids, part[2]!.toLowerCase(), declarations);
-          matched = true;
+        const last = withoutPseudoClasses(compounds.at(-1) ?? "");
+        const weight = specificity(selector);
+        let proven = false;
+        if (plain && compounds.length === 1) {
+          const read = provenRule(last, new Map([...valid].map(([property, { value, important }]) => [property, { value, weight: weigh(important, weight, order) }])));
+          const held = read && (rules.proven.get(read.key) ?? []);
+          if (read && held && held.length < MAX_PROVEN_RULES) {
+            rules.proven.set(read.key, [...held, read.rule]);
+            proven = true;
+          }
         }
-        for (const part of last.matchAll(/\[\s*([a-z0-9_:-]+)\s*(?:[~|^$*]?=\s*["']?[^"'\]]*["']?\s*)?\]/gi)) {
-          // A value test (`=`, `^=`, `*=`…) is read as "has the attribute", hiding at least as much.
-          if (hides) rules.hiddenAttributes.add(part[1]!.toLowerCase());
-          matched = true;
+        const { keys, attributes } = keysOf(last);
+        if (hides) for (const name of attributes) rules.hiddenAttributes.add(name);
+        if (long) {
+          for (const key of keys) keep(entries(rules.loose, key), "display", { value: "none", weight: Infinity, strength: 2 });
+          continue;
         }
-        const tag = /^([a-z][a-z0-9]*)/i.exec(last)?.[1]?.toLowerCase();
-        if (matched || tag === undefined) continue;
-        merge(rules.tags, tag, tag === "html" || tag === "body"
-          ? new Map([...declarations].filter(([property]) => INHERITED_PROPERTIES.has(property))) : declarations);
+        for (const key of keys) {
+          for (const { property, value, important, sure, strength } of declared) {
+            if (isPage(key) && !INHERITED_PROPERTIES.has(property)) continue;
+            if (TEXT_PROPERTIES.has(property)) {
+              if (!readable || (!hides && compounds.length > 1)) continue;
+              if (proven && sure) continue;
+            }
+            // An important one in an at-rule may be in a cascade layer, where it beats every important one outside it but a style attribute's.
+            const ranked = important && rule.conditional ? INLINE_SPECIFICITY - 1 : weight;
+            if (strength > 0) keep(entries(rules.loose, key), property, { value, weight: weigh(important, ranked, order), strength });
+          }
+        }
       }
     }
   }
   return rules;
 }
 
-/** An element's style: the stylesheet's rules for its tag, classes and ID, then its own `style`. */
-function styleOf(element: Element, rules: StyleRules): Map<string, string> {
-  const style = new Map(rules.tags.get(element.tag));
-  for (const name of (element.attrs.class ?? "").toLowerCase().split(/\s+/)) {
-    for (const [property, value] of rules.classes.get(name) ?? []) style.set(property, value);
+// CSS Syntax's code point classes, by code unit: past ASCII, everything is a name code point.
+const isCssNewline = (code: number) => code === 10 || code === 13 || code === 12;
+const isCssWhitespace = (code: number) => code === 32 || code === 9 || isCssNewline(code);
+const isCssHex = (code: number) => (code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102);
+const isCssNameStart = (code: number) => (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || code === 95 || code >= 128;
+const isCssName = (code: number) => isCssNameStart(code) || (code >= 48 && code <= 57) || code === 45;
+const isCssNonPrintable = (code: number) => (code >= 1 && code <= 8) || code === 11 || (code >= 14 && code <= 31) || code === 127;
+
+/** Whether `css[at]` is a backslash that escapes what follows: one before a newline doesn't. */
+const isCssEscape = (css: string, at: number) => css.charCodeAt(at) === 92 && !isCssNewline(css.charCodeAt(at + 1));
+
+/** Where the escape at `at` ends: up to six hex digits and one whitespace after them, or one code unit. */
+function cssEscapeEnd(css: string, at: number): number {
+  let end = at + 1;
+  if (!isCssHex(css.charCodeAt(end))) return Math.min(end + 1, css.length);
+  while (end < at + 7 && isCssHex(css.charCodeAt(end))) end++;
+  if (css.startsWith("\r\n", end)) return end + 2;
+  return isCssWhitespace(css.charCodeAt(end)) ? end + 1 : end;
+}
+
+/**
+ * What the escape from `at` to `end` stands for in a name: its code point, or U+FFFD for one a name
+ * can't hold unescaped (`\{`, `\;`, `\"`), so it can't be read as a brace, a semicolon or a quote.
+ * U+FFFD is also what CSS makes of a null, a surrogate or a code point past U+10FFFF.
+ */
+function cssEscapeText(css: string, at: number, end: number): string {
+  if (!isCssHex(css.charCodeAt(at + 1))) return isCssName(css.charCodeAt(at + 1)) ? css[at + 1]! : "\uFFFD";
+  const code = Number.parseInt(css.slice(at + 1, Math.min(end, at + 7)), 16);
+  return isCssName(code) && code <= 0x10ffff && (code < 0xd800 || code > 0xdfff) ? String.fromCodePoint(code) : "\uFFFD";
+}
+
+/** Where the string opening at `at` ends: its closing quote, or before a newline it doesn't escape. */
+function cssStringEnd(css: string, at: number): number {
+  const quote = css.charCodeAt(at);
+  for (let end = at + 1; end < css.length;) {
+    const code = css.charCodeAt(end);
+    if (code === quote) return end + 1;
+    if (isCssNewline(code)) return end;
+    if (code !== 92) end++;
+    else if (isCssNewline(css.charCodeAt(end + 1))) end += css.startsWith("\r\n", end + 1) ? 3 : 2;
+    else end = cssEscapeEnd(css, end);
   }
-  for (const [property, value] of rules.ids.get(element.attrs.id?.toLowerCase() ?? "") ?? []) style.set(property, value);
-  for (const [property, value] of parseDeclarations(element.attrs.style ?? "")) style.set(property, value);
-  return style;
+  return css.length;
+}
+
+/** Where the unquoted `url(` argument starting at `at` ends, a malformed one included: at its `)`, or the end of the sheet. */
+function cssUrlEnd(css: string, at: number): number {
+  let bad = false;
+  for (let end = at; end < css.length;) {
+    const code = css.charCodeAt(end);
+    if (code === 41) return end;
+    if (isCssEscape(css, end)) {
+      end = cssEscapeEnd(css, end);
+    } else if (bad) {
+      end++;
+    } else if (isCssWhitespace(code)) {
+      while (isCssWhitespace(css.charCodeAt(end))) end++;
+      bad = end < css.length && css.charCodeAt(end) !== 41;
+    } else {
+      bad = code === 34 || code === 39 || code === 40 || code === 92 || isCssNonPrintable(code);
+      end++;
+    }
+  }
+  return css.length;
+}
+
+/**
+ * A stylesheet as the rule reader reads it, tokenized as CSS Syntax does, in one pass: comments
+ * dropped, each string emptied to `""`, each unquoted `url(…)` argument emptied, and each escape
+ * written as {@link cssEscapeText} gives it. So a brace, semicolon, colon, quote or `@` is left only
+ * where the CSS has one: one inside a string, an argument or an escape can't open or close a rule or
+ * a declaration, and a `/*` inside one doesn't open a comment. A comment left open runs to the end
+ * of the sheet. The regex `/\/\*[\s\S]*?\*\//g` took a `/*` inside a string for a comment and left
+ * an open one in place, so CSS a browser ignores could undo the rules before it, and it searched the
+ * rest of the sheet again from every `/*`; strings and escapes were read as if they were structure.
+ */
+function cssSkeleton(css: string): string {
+  let out = "";
+  let from = 0;
+  const replace = (start: number, end: number, text: string) => {
+    out += css.slice(from, start) + text;
+    from = end;
+  };
+  // Whether a `#` or `@` comes just before, making a name that follows a hash or an at-rule, not a `url(`.
+  let sigil = false;
+  for (let at = 0; at < css.length;) {
+    const code = css.charCodeAt(at);
+    if (code === 47 && css.charCodeAt(at + 1) === 42) {
+      // A comment separates what is either side of it: `1/**/6px` is two values, not `16px`.
+      const close = css.indexOf("*/", at + 2);
+      replace(at, close === -1 ? css.length : close + 2, " ");
+      at = from;
+      sigil = false;
+    } else if (code === 34 || code === 39) {
+      replace(at, cssStringEnd(css, at), "\"\"");
+      at = from;
+      sigil = false;
+    } else if (isCssName(code) || isCssEscape(css, at)) {
+      // A name, read whole; if it spells `url` and a `(` follows, the unquoted argument is emptied.
+      const next = css.charCodeAt(at + 1);
+      const ident = !sigil && (isCssNameStart(code) || code === 92 || (code === 45 && (isCssNameStart(next) || next === 45 || isCssEscape(css, at + 1))));
+      let name = "";
+      while (at < css.length && (isCssName(css.charCodeAt(at)) || isCssEscape(css, at))) {
+        let char = css[at]!;
+        if (isCssEscape(css, at)) {
+          const end = cssEscapeEnd(css, at);
+          replace(at, end, char = cssEscapeText(css, at, end));
+          at = end;
+        } else {
+          at++;
+        }
+        if (name.length < 4) name += char.charCodeAt(0) < 128 ? char.toLowerCase() : "\u0080";
+      }
+      sigil = false;
+      if (ident && name === "url" && css.charCodeAt(at) === 40) {
+        at++;
+        while (isCssWhitespace(css.charCodeAt(at))) at++;
+        if (css.charCodeAt(at) !== 34 && css.charCodeAt(at) !== 39) {
+          replace(at, cssUrlEnd(css, at), "");
+          at = from;
+        }
+      }
+    } else if (code === 60 && css.startsWith("!--", at + 1)) {
+      // `<!--` is one token, so its dashes don't start a name.
+      at += 4;
+      sigil = false;
+    } else {
+      sigil = (code === 35 || code === 64) && (isCssName(css.charCodeAt(at + 1)) || isCssEscape(css, at + 1));
+      at++;
+    }
+  }
+  return out + css.slice(from);
+}
+
+/**
+ * A compound selector without its pseudo-classes and pseudo-elements: `p.x:first-child` → `p.x`.
+ * `/::?[a-z-]+(\([^)]*\))?/gi` searched the rest of the compound for a `)` from every `:x(` that
+ * has none. Past the compound's last `)` no argument can close, so that part is read without one.
+ */
+function withoutPseudoClasses(compound: string): string {
+  const end = compound.lastIndexOf(")") + 1;
+  return compound.slice(0, end).replace(/::?[a-z-]+(\([^)]*\))?/gi, "") + compound.slice(end).replace(/::?[a-z-]+/gi, "");
+}
+
+/**
+ * A selector's compounds, split as `split(/[\t\n\f\r >+~]+/)` splits it, but not inside an attribute
+ * test's brackets, which may hold whitespace (`[a=b i]`): split there, `i]` was the last compound,
+ * and the test was read as none.
+ */
+function compoundsOf(selector: string): string[] {
+  const masked = selector.replace(/\[[^\]]*\]?/g, test => test.replace(/[\t\n\f\r >+~]/g, "_"));
+  const compounds: string[] = [];
+  let from = 0;
+  for (const { index, 0: run } of masked.matchAll(/[\t\n\f\r >+~]+/g)) {
+    compounds.push(selector.slice(from, index));
+    from = index + run.length;
+  }
+  compounds.push(selector.slice(from));
+  return compounds;
+}
+
+/**
+ * The attributes a compound selector tests (`[data-x]`, `td[data-y='1']`, `[ data-z = a i ]`), in
+ * one pass: the pattern `/\[\s*([a-z0-9_:-]+)\s*(?:[~|^$*]?=\s*["']?[^"'\]]*["']?\s*)?\]/gi`
+ * searched the rest of the compound again from every `[` it could not close. A test ends at the
+ * first `]` after its `[`. Whatever its value and flag, it is read as testing that the attribute is
+ * there, which hides at least as much.
+ */
+function selectedAttributes(compound: string): string[] {
+  const names: string[] = [];
+  let close = -1;
+  for (let open = compound.indexOf("["); open !== -1; open = compound.indexOf("[", open + 1)) {
+    if (open > close && (close = compound.indexOf("]", open)) === -1) break;
+    let start = open + 1;
+    while (start < close && isCssWhitespace(compound.charCodeAt(start))) start++;
+    let end = start;
+    while (end < close && /[a-z0-9_:-]/i.test(compound[end]!)) end++;
+    let after = end;
+    while (after < close && isCssWhitespace(compound.charCodeAt(after))) after++;
+    if (end > start && (after === close || compound[after] === "=" || ("~|^$*".includes(compound[after]!) && compound[after + 1] === "="))) {
+      names.push(compound.slice(start, end));
+      open = close;
+    }
+  }
+  return names;
+}
+
+/** A property's winning value in one reading of an element's style ({@link styleOf}). */
+type Style = ReadonlyMap<string, string>;
+
+/** An element's classes, ID and attribute values as a rule's tests are compared with them: as written, or folded to lower case in ASCII. */
+type Values = { classes: ReadonlySet<string>; id: string; value: (name: string) => string };
+
+/** Whether a proven rule's compound matches an element, by its tests as written or folded, against its values read the same way. */
+function matches(rule: Proven, tests: Tests, element: Element, values: Values): boolean {
+  return (rule.tag === undefined || rule.tag === element.tag)
+    && tests.classes.every(name => values.classes.has(name))
+    && tests.ids.every(id => id === values.id)
+    && tests.attributes.every(([name, value]) => Object.hasOwn(element.attrs, name) && (value === undefined || value === values.value(name)));
+}
+
+/** The style of an element with no `style`, class or ID, whose type no rule names. */
+const NO_STYLE: [Style, Style, Style] = [new Map(), new Map(), new Map()];
+
+/**
+ * An element's style, read three ways. `proven`: of the rules certainly applied to it and its own
+ * `style` attribute (read as a stylesheet is, {@link cssSkeleton}), the declaration for each property
+ * that wins in the cascade ({@link weigh}). `loose`: that, with what the rules that may apply set and
+ * what its own style sets only because it would hide ({@link keep}), where it weighs at least as
+ * much, so it can hide and never show what `proven` hides. `pin`: the last values of its type's,
+ * classes' and ID's rules, then its own, as the reader before this one took them, by its attributes as
+ * it read them ({@link Element}), its names folded to lower case as JavaScript folds them. What hides
+ * in any reading is hidden ({@link elementOut}, {@link textOut}), `pin` as that reader judged it
+ * ({@link pinHides}, {@link pinInherited}). Its values are each folded once, however many rules test them.
+ */
+function styleOf(element: Element, rules: StyleRules): [proven: Style, loose: Style, pin: Style] {
+  const { attrs, tag } = element;
+  // Most elements: nothing names them, so there is nothing to read.
+  if (attrs.style === undefined && attrs.class === undefined && attrs.id === undefined && element.legacy === undefined
+    && !rules.proven.has(tag) && !rules.loose.has(tag) && !rules.pin.has(tag) && !rules.proven.has("*") && !rules.loose.has("*")) return NO_STYLE;
+  const classes = (attrs.class ?? "").split(/[\t\n\f\r ]+/).filter(name => name !== "");
+  const exact: Values = { classes: new Set(classes), id: attrs.id ?? "", value: name => attrs[name]! };
+  const foldedValues = new Map<string, string>();
+  const folded: Values = {
+    classes: new Set(classes.map(asciiLowerCase)),
+    id: asciiLowerCase(attrs.id ?? ""),
+    value: name => {
+      let value = foldedValues.get(name);
+      if (value === undefined) foldedValues.set(name, value = asciiLowerCase(attrs[name]!));
+      return value;
+    },
+  };
+  const keys = new Set([tag, "*", ...[...folded.classes].map(name => `.${name}`)]);
+  if (attrs.id) keys.add(`#${folded.id}`);
+  const winners = new Map<string, Weighted>();
+  const apply = (declarations: Iterable<[string, Weighted]>) => {
+    for (const [property, declared] of declarations) if (declared.weight > (winners.get(property)?.weight ?? -1)) winners.set(property, declared);
+  };
+  const candidates = new Map<string, Candidate>();
+  for (const key of keys) {
+    for (const rule of rules.proven.get(key) ?? []) {
+      if (matches(rule, rule.tests, element, exact)) apply(rule.declarations);
+      // One that matches only ignoring case does in quirks mode, which a doctype can leave a browser in.
+      else if (matches(rule, rule.folded, element, folded)) for (const [property, held] of rule.candidates) keep(candidates, property, held);
+    }
+  }
+  const { valid, hiding } = parseDeclarations(cssSkeleton(attrs.style ?? ""), rules.quirks);
+  // In a style attribute, `revert-layer` rolls the cascade back to the stylesheets' declarations.
+  const own = [...valid].filter(([, { value }]) => value !== "revert-layer");
+  apply(own.map(([property, { value, important }]) => [property, { value, weight: weigh(important, INLINE_SPECIFICITY, 0) }]));
+  for (const [property, { value, important }] of hiding) keep(candidates, property, candidate(property, value, weigh(important, INLINE_SPECIFICITY, 0)));
+  const proven = new Map([...winners].map(([property, { value }]) => [property, value]));
+  const loose = new Map(proven);
+  for (const key of keys) for (const [property, held] of rules.loose.get(key) ?? []) keep(candidates, property, held);
+  for (const [property, { value, weight }] of candidates) if (weight >= (winners.get(property)?.weight ?? -1)) loose.set(property, value);
+  const pin = new Map<string, string>();
+  const old = element.legacy ?? attrs;
+  const pinKeys = [tag, ...(old.class ?? "").toLowerCase().split(/\s+/).map(name => `.${name}`), `#${old.id?.toLowerCase() ?? ""}`];
+  for (const key of pinKeys) for (const [property, value] of rules.pin.get(key) ?? []) pin.set(property, value);
+  for (const [property, value] of pinDeclarations(old.style ?? "")) pin.set(property, value);
+  return [proven, loose, pin];
 }
 
 /** Text no larger than this, in pixels, can't be read: it counts as hidden. */
@@ -228,13 +1457,14 @@ const COLLAPSED_SPACING_PX = -16;
 
 /** Whether declarations hide an element and all it holds. */
 function hidesElement(style: ReadonlyMap<string, string>, options: { sized?: boolean } = {}): boolean {
+  if (style.size === 0) return false;
   if (style.get("display") === "none" || style.get("visibility") === "hidden" || style.get("visibility") === "collapse"
     || style.get("mso-hide") === "all" || style.get("content-visibility") === "hidden") return true;
   const opacity = style.get("opacity");
   if (opacity !== undefined && (opacity.endsWith("%") ? Number.parseFloat(opacity) / 100 : Number.parseFloat(opacity)) <= 0.05) return true;
   // A zero box hides what overflows it in mail clients, which clip regardless of `overflow`; a box
   // of a pixel or two does so when it clips. (An image's own size is read as a tracking pixel instead.)
-  const clips = ["overflow", "overflow-x", "overflow-y"].some(property => /^(hidden|clip)$/.test(style.get(property) ?? ""));
+  const clips = ["overflow", "overflow-x", "overflow-y"].some(property => (style.get(property) ?? "").split(/\s+/).some(word => word === "hidden" || word === "clip"));
   for (const property of options.sized === false ? [] : ["max-height", "height", "max-width", "width"]) {
     const size = cssLength(style.get(property) ?? "");
     if (size !== undefined && (size === 0 || (clips && size <= MAX_CLIPPED_PX))) return true;
@@ -244,9 +1474,94 @@ function hidesElement(style: ReadonlyMap<string, string>, options: { sized?: boo
     const offset = cssLength(style.get(side) ?? "");
     if (offset !== undefined && offset <= OFF_SCREEN_PX) return true;
   }
-  const indent = cssLength(style.get("text-indent") ?? "");
+  // With `hanging` or `each-line`, a text indent moves text as far where a browser reads it.
+  const indent = cssLength((style.get("text-indent") ?? "").replace(/\b(?:hanging|each-line)\b/g, ""));
   if (indent !== undefined && indent <= OFF_SCREEN_PX) return true;
-  const spacing = cssLength(style.get("letter-spacing") ?? "");
+  // A percentage in letter spacing is of the type size, as an `em` is, where a browser reads one.
+  const letterSpacing = style.get("letter-spacing") ?? "";
+  const spacing = letterSpacing.endsWith("%") ? Number.parseFloat(letterSpacing) * 16 / 100 : cssLength(letterSpacing);
+  if (spacing !== undefined && spacing <= COLLAPSED_SPACING_PX) return true;
+  const clip = style.get("clip")?.replace(/\s+/g, "");
+  if (clip !== undefined && /^rect\((0(px)?,?){3}0(px)?\)$/.test(clip)) return true;
+  const clipPath = style.get("clip-path");
+  if (clipPath !== undefined && /inset\(\s*50%|circle\(\s*0|polygon\(\s*0(px)?\s+0(px)?\s*\)/.test(clipPath)) return true;
+  const transform = style.get("transform");
+  if (transform !== undefined) {
+    // Each call's arguments, where no bracket opens inside them: so each is read once, and a call
+    // beside others (`scale(0) rotate(calc(1deg))`) is read as well as one alone.
+    for (const [, name, args] of transform.matchAll(/(scale[xy]?|translate(?:3d|x|y)?)\(([^()]*)\)/g)) {
+      const parts = args!.split(",");
+      if (name!.startsWith("scale") ? parts.some(part => ZERO.test(part)) : parts.some(part => (cssLength(part) ?? 0) <= OFF_SCREEN_PX)) return true;
+    }
+  }
+  // The `scale` property, and a filter's `opacity()`, hide as `transform: scale()` and `opacity` do.
+  // Neither is ever read as showing ({@link validValue}): each only hides.
+  const scale = style.get("scale");
+  if (scale !== undefined && scale.split(/[\t\n\f\r ]+/).some(part => ZERO.test(part))) return true;
+  const filter = style.get("filter");
+  if (filter !== undefined) {
+    for (const [, amount] of filter.matchAll(/opacity\(([^()]*)\)/g)) {
+      const value = amount!.trim();
+      if (value !== "" && (value.endsWith("%") ? Number.parseFloat(value) / 100 : Number.parseFloat(value)) <= 0.05) return true;
+    }
+  }
+  return false;
+}
+
+/** Zero, as a number or a percentage (`scale(0%)`). */
+const ZERO = new RegExp(String.raw`^\s*[+-]?(?:0+(?:\.0+)?|\.0+)(?:e[+-]?[0-9]+)?%?\s*$`);
+
+/**
+ * A CSS length in pixels, roughly (absolute units converted, and font-relative ones at the default
+ * 16px); undefined when it isn't one. A number is read as CSS writes one: a sign, a leading `.`, an
+ * exponent (`.5e-1px`).
+ */
+function cssLength(value: string): number | undefined {
+  const match = DIMENSION.exec(value.trim());
+  if (!match) return undefined;
+  const number = Number(match[1]);
+  switch (match[2]) {
+    case undefined: case "px": return number;
+    case "pt": return number * 4 / 3;
+    case "pc": return number * 16;
+    case "in": return number * 96;
+    case "cm": return number * 96 / 2.54;
+    case "mm": return number * 96 / 25.4;
+    case "q": return number * 96 / 101.6;
+    case "em": case "rem": case "ic": case "ric": return number * 16;
+    case "ch": case "ex": case "rch": case "rex": case "cap": case "rcap": return number * 8;
+    case "lh": case "rlh": return number * 19.2;
+    // Relative to something unknown (a percentage, the viewport, a container): only zero is certain.
+    default: return number === 0 ? 0 : undefined;
+  }
+}
+
+/**
+ * Whether declarations hide an element, as the reader before this one judged it, for its reading
+ * (`pin`, {@link styleOf}) and the rules it read ({@link pinStylesheetRules}): its own test, with its
+ * lengths ({@link pinLength}), and its first translation's arguments found in one pass, where
+ * `/translate(?:3d|x|y)?\(([^)]*)\)/i` searched the rest again from every `translate(` with no `)`
+ * after it. A rule's value too long to read (UNREAD) hides.
+ */
+function pinHides(style: Style, options: { sized?: boolean } = {}): boolean {
+  if (style.has(UNREAD)) return true;
+  if (style.get("display") === "none" || style.get("visibility") === "hidden" || style.get("visibility") === "collapse"
+    || style.get("mso-hide") === "all" || style.get("content-visibility") === "hidden") return true;
+  const opacity = style.get("opacity");
+  if (opacity !== undefined && (opacity.endsWith("%") ? Number.parseFloat(opacity) / 100 : Number.parseFloat(opacity)) <= 0.05) return true;
+  const clips = ["overflow", "overflow-x", "overflow-y"].some(property => /^(hidden|clip)$/.test(style.get(property) ?? ""));
+  for (const property of options.sized === false ? [] : ["max-height", "height", "max-width", "width"]) {
+    const size = pinLength(style.get(property) ?? "");
+    if (size !== undefined && (size === 0 || (clips && size <= MAX_CLIPPED_PX))) return true;
+  }
+  const position = style.get("position");
+  for (const side of position === "absolute" || position === "fixed" ? ["left", "top", "right", "bottom", "margin-left", "margin-top"] : ["margin-left", "margin-top"]) {
+    const offset = pinLength(style.get(side) ?? "");
+    if (offset !== undefined && offset <= OFF_SCREEN_PX) return true;
+  }
+  const indent = pinLength(style.get("text-indent") ?? "");
+  if (indent !== undefined && indent <= OFF_SCREEN_PX) return true;
+  const spacing = pinLength(style.get("letter-spacing") ?? "");
   if (spacing !== undefined && spacing <= COLLAPSED_SPACING_PX) return true;
   const clip = style.get("clip")?.replace(/\s+/g, "");
   if (clip !== undefined && /^rect\((0(px)?,?){3}0(px)?\)$/.test(clip)) return true;
@@ -255,28 +1570,39 @@ function hidesElement(style: ReadonlyMap<string, string>, options: { sized?: boo
   const transform = style.get("transform");
   if (transform !== undefined) {
     if (/scale[xy]?\(\s*0(\.0+)?\s*[,)]/.test(transform)) return true;
-    const moved = /translate(?:3d|x|y)?\(([^)]*)\)/i.exec(transform)?.[1]?.split(",") ?? [];
-    if (moved.some(part => (cssLength(part) ?? 0) <= OFF_SCREEN_PX)) return true;
+    const translate = /translate(?:3d|x|y)?\(/i.exec(transform);
+    const from = translate ? translate.index + translate[0].length : 0;
+    const to = translate ? transform.indexOf(")", from) : -1;
+    if (to !== -1 && transform.slice(from, to).split(",").some(part => (pinLength(part) ?? 0) <= OFF_SCREEN_PX)) return true;
   }
   return false;
 }
 
-/** A CSS length in pixels, roughly (pt and em are converted); undefined when it isn't one. */
-function cssLength(value: string): number | undefined {
-  const match = /^(-?[0-9]*\.?[0-9]+)(px|pt|em|rem|%|vw|vh|vmin|vmax|ch|ex|cm|mm|in|pc)?$/.exec(value.replace(/!important/i, "").trim());
+/** A length as the reader before this one read one: `!important` dropped again, and only its number forms and units. */
+function pinLength(value: string): number | undefined {
+  const length = value.replace(/!important/i, "").trim();
+  return /^-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:px|pt|em|rem|%|vw|vh|vmin|vmax|ch|ex|cm|mm|in|pc)?$/.test(length) ? cssLength(length) : undefined;
+}
+
+/** `font-size`'s keywords in pixels, at a browser's default 16px. */
+const FONT_SIZE_PIXELS: ReadonlyMap<string, number> = new Map([
+  ["xx-small", 9], ["x-small", 10], ["small", 13], ["medium", 16], ["large", 18], ["x-large", 24], ["xx-large", 32], ["xxx-large", 48], ["initial", 16],
+]);
+
+/** A `font-size` in pixels, a relative one (`%`, `em`, `smaller`) from the size its element inherits; undefined to inherit it. */
+function fontPixels(value: string, inherited: number): number | undefined {
+  const keyword = FONT_SIZE_PIXELS.get(value);
+  if (keyword !== undefined) return keyword;
+  if (value === "smaller") return inherited / 1.2;
+  if (value === "larger") return inherited * 1.2;
+  const match = DIMENSION.exec(value);
   if (!match) return undefined;
   const number = Number(match[1]);
   switch (match[2]) {
-    case "pt": return number * 4 / 3;
-    case "pc": return number * 16;
-    case "in": return number * 96;
-    case "cm": return number * 96 / 2.54;
-    case "mm": return number * 96 / 25.4;
-    case "em": case "rem": return number * 16;
-    case "ch": case "ex": return number * 8;
-    // Relative to something unknown: only zero is certain.
-    case "%": case "vw": case "vh": case "vmin": case "vmax": return number === 0 ? 0 : undefined;
-    default: return number;
+    case "%": return inherited * number / 100;
+    case "em": return inherited * number;
+    case "ch": case "ex": return inherited * number / 2;
+    default: return cssLength(value);
   }
 }
 
@@ -306,10 +1632,15 @@ const NAMED_COLORS: ReadonlyMap<string, string> = new Map(("aliceblue:f0f8ff ant
 
 type Rgba = [number, number, number, number];
 
-/** A CSS or HTML colour as RGB and alpha (`transparent` is alpha 0); undefined for anything else. */
-function parseColor(value: string | undefined): Rgba | undefined {
+/**
+ * A CSS or HTML colour as RGB and alpha (`transparent` is alpha 0); undefined for anything else.
+ * `legacy`, as the reader before this one read one: lower-cased as JavaScript lower-cases it, and a
+ * function's arguments read as it read them ({@link pinFunctionColor}).
+ */
+function parseColor(value: string | undefined, legacy = false): Rgba | undefined {
   if (!value) return undefined;
-  let text = value.replace(/!important/i, "").trim().toLowerCase();
+  const bare = value.replace(/!important/i, "").trim();
+  let text = legacy ? bare.toLowerCase() : asciiLowerCase(bare);
   if (text === "transparent") return [0, 0, 0, 0];
   text = NAMED_COLORS.get(text) ?? text;
   const hex = /^#?([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/.exec(text);
@@ -321,30 +1652,71 @@ function parseColor(value: string | undefined): Rgba | undefined {
   }
   const fn = /^(rgba?|hsla?)\(([^)]*)\)$/.exec(text);
   if (!fn) return undefined;
-  const parts = fn[2]!.trim().split(/\s*[,/]\s*|\s+/).filter(Boolean);
-  if (parts.length < 3) return undefined;
-  const alphaPart = parts[3];
-  const alpha = alphaPart === undefined ? 1 : alphaPart.endsWith("%") ? Number.parseFloat(alphaPart) / 100 : Number.parseFloat(alphaPart);
-  if (!Number.isFinite(alpha)) return undefined;
+  if (legacy) return pinFunctionColor(fn[1]!, fn[2]!);
+  // Three values and an alpha, all with commas between or none, with a `/` before the alpha.
+  const args = fn[2]!.trim();
+  const [main = "", alphaPart, ...extra] = args.includes(",") ? [args] : args.split(/\s*\/\s*/);
+  const parts = args.includes(",") ? main.split(/\s*,\s*/) : main.split(/\s+/);
+  if (extra.length > 0 || parts.length < 3 || parts.length > (alphaPart === undefined && args.includes(",") ? 4 : 3)) return undefined;
+  const alpha = fraction(parts[3] ?? alphaPart ?? "1", 1);
+  if (alpha === undefined) return undefined;
   if (fn[1]!.startsWith("rgb")) {
-    const channels = parts.slice(0, 3).map(part => part.endsWith("%") ? Number.parseFloat(part) * 2.55 : Number.parseFloat(part));
-    if (channels.some(channel => !Number.isFinite(channel))) return undefined;
-    return [channels[0]!, channels[1]!, channels[2]!, Math.max(0, Math.min(1, alpha))];
+    // All numbers or all percentages, in range.
+    const unit = PERCENTAGE.test(parts[0]!) ? PERCENTAGE : NUMBER;
+    if (!parts.slice(0, 3).every(part => unit.test(part))) return undefined;
+    const [red, green, blue] = parts.map(part => fraction(part, 255)!);
+    return [red!, green!, blue!, alpha];
   }
-  const hue = Number.parseFloat(parts[0]!), saturation = Number.parseFloat(parts[1]!) / 100, lightness = Number.parseFloat(parts[2]!) / 100;
-  if (![hue, saturation, lightness].every(Number.isFinite)) return undefined;
+  const hueMatch = HUE.exec(parts[0]!);
+  const saturation = PERCENTAGE.test(parts[1]!) ? fraction(parts[1]!, 1) : undefined;
+  const lightness = PERCENTAGE.test(parts[2]!) ? fraction(parts[2]!, 1) : undefined;
+  if (!hueMatch || saturation === undefined || lightness === undefined) return undefined;
+  const turn = { deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 }[hueMatch[2] ?? "deg"]!;
+  return [...hslRgb(((Number(hueMatch[1]) * turn) % 360 + 360) % 360, saturation, lightness), alpha];
+}
+
+/** A hue in degrees, and a saturation and lightness as fractions, as RGB. */
+function hslRgb(hue: number, saturation: number, lightness: number): [number, number, number] {
   const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
   const channel = (n: number) => {
     const k = (n + hue / 30) % 12;
     return 255 * (lightness - chroma / 2 * Math.max(-1, Math.min(k - 3, 9 - k, 1)));
   };
-  return [channel(0), channel(8), channel(4), Math.max(0, Math.min(1, alpha))];
+  return [channel(0), channel(8), channel(4)];
 }
 
-/** The background colour a `background` or `background-color` declaration sets, if any. */
-function backgroundColor(element: Element, style: ReadonlyMap<string, string>, behind: Rgba): Rgba | undefined {
-  const color = parseColor(style.get("background-color")) ?? parseColor(style.get("background")?.split(/\s+/).find(part => parseColor(part) !== undefined))
-    ?? parseColor(element.attrs.bgcolor);
+/**
+ * A colour function's arguments as the reader before this one read them: split at commas, slashes
+ * and whitespace, any number past three, each read as far as it is a number, the alpha clamped but
+ * no channel, and a hue in degrees whatever its unit.
+ */
+function pinFunctionColor(name: string, args: string): Rgba | undefined {
+  const parts = args.trim().split(/\s*[,/]\s*|\s+/).filter(Boolean);
+  if (parts.length < 3) return undefined;
+  const alphaPart = parts[3];
+  const alpha = alphaPart === undefined ? 1 : alphaPart.endsWith("%") ? Number.parseFloat(alphaPart) / 100 : Number.parseFloat(alphaPart);
+  if (!Number.isFinite(alpha)) return undefined;
+  const [first, second, third] = name.startsWith("rgb")
+    ? parts.slice(0, 3).map(part => part.endsWith("%") ? Number.parseFloat(part) * 2.55 : Number.parseFloat(part))
+    : [Number.parseFloat(parts[0]!), Number.parseFloat(parts[1]!) / 100, Number.parseFloat(parts[2]!) / 100];
+  if (![first, second, third].every(Number.isFinite)) return undefined;
+  return [...(name.startsWith("rgb") ? [first!, second!, third!] : hslRgb(first!, second!, third!)), Math.max(0, Math.min(1, alpha))] as Rgba;
+}
+
+const PERCENTAGE = new RegExp(`^${CSS_NUMBER}%$`);
+const HUE = new RegExp(`^(${CSS_NUMBER})(deg|grad|rad|turn)?$`);
+
+/** A number or percentage as a fraction of `whole`, clamped to it; undefined if it is neither. */
+function fraction(value: string, whole: number): number | undefined {
+  const percent = PERCENTAGE.test(value);
+  if (!percent && !NUMBER.test(value)) return undefined;
+  const number = percent ? Number(value.slice(0, -1)) / 100 * whole : Number(value);
+  return Math.max(0, Math.min(whole, number));
+}
+
+/** The background colour a style (`background` read as the colour it sets, {@link parseDeclarations}) or a `bgcolor` gives an element, if any. */
+function backgroundColor(element: Element, style: Style, behind: Rgba): Rgba | undefined {
+  const color = parseColor(style.get("background-color")) ?? parseColor(style.get("background")) ?? parseColor(element.attrs.bgcolor);
   return color && blend(color, behind);
 }
 
@@ -356,6 +1728,8 @@ function blend(color: Rgba, behind: Rgba): Rgba {
 
 /** What text inherits from the elements around it. */
 type Inherited = { color: Rgba; background: Rgba; fontSize: number };
+/** What text inherits by each reading of the styles around it ({@link styleOf}): hidden by any, it is hidden. */
+type Readings = readonly Inherited[];
 
 /** Text this close in RGB distance to its background can't be read: it counts as hidden. */
 const INVISIBLE_DISTANCE = 24;
@@ -365,7 +1739,21 @@ function colorDistance(a: readonly number[], b: readonly number[]): number {
 }
 
 /** Known open-tracking image hosts and paths. */
-const TRACKER = /(?:\/wf\/open|\/track\/open|\/trk\/|\/open\.gif|\/pixel\.(?:gif|png)|\/beacon|list-manage\.com\/track|mandrillapp\.com\/track|sendgrid\.net\/wf|mailchimp\.com\/track|hubspotemail\.net|t\.hubspotemail|\/e2t\/o\/|google-analytics\.com\/collect|mailtrack|mixmax\.com\/api\/track|yesware|bananatag|\/o\.gif|email\.mg\.[^/]+\/o\/|links\.[^/]+\/o\/|cmail\d+\.com\/t\/|exct\.net\/open)/i;
+const TRACKER = /(?:\/wf\/open|\/track\/open|\/trk\/|\/open\.gif|\/pixel\.(?:gif|png)|\/beacon|list-manage\.com\/track|mandrillapp\.com\/track|sendgrid\.net\/wf|mailchimp\.com\/track|hubspotemail\.net|t\.hubspotemail|\/e2t\/o\/|google-analytics\.com\/collect|mailtrack|mixmax\.com\/api\/track|yesware|bananatag|\/o\.gif|cmail\d+\.com\/t\/|exct\.net\/open)/i;
+
+/**
+ * Mailgun-style open tracking: `/o/` after a path segment holding `email.mg.` or `links.` and more,
+ * as `/(?:email\.mg\.|links\.)[^/]+\/o\//i` matches it. Read back from each `/o/`, since the pattern
+ * searched for the next `/` again from every `links.`.
+ */
+function mailgunOpen(src: string): boolean {
+  const open = /\/o\//gi;
+  for (let match = open.exec(src); match; match = open.exec(src)) {
+    if (/(?:email\.mg\.|links\.)[^/]/i.test(src.slice(src.lastIndexOf("/", match.index - 1) + 1, match.index))) return true;
+    open.lastIndex = match.index + 1;
+  }
+  return false;
+}
 
 type Counters = {
   hiddenRegions: number;
@@ -381,18 +1769,25 @@ export function mailToMarkdown(
   body: { contentType: "html" | "text"; content: string },
   options: { maxChars: number; inlineImages?: ReadonlyMap<string, string> },
 ): MailMarkdown {
+  if (body.contentType === "html" && body.content.length > MAX_MAIL_HTML_CHARS) {
+    return { markdown: truncate(TOO_LONG, options.maxChars).text, links: [], removed: [], truncated: true, hidesText: false };
+  }
   const counters: Counters = { hiddenRegions: 0, invisibleChars: 0, trackingImages: 0, dataImages: 0, unsafeLinks: 0, unwrapped: 0 };
   const links = new LinkCollector();
   let markdown: string;
   if (body.contentType === "text") {
     markdown = textToMarkdown(body.content, counters, links);
   } else {
-    const rules = stylesheetRules(body.content);
-    const { root, base } = buildTree(body.content);
+    const { root, base, styles } = buildTree(body.content);
+    if (styles.unreadable) return { markdown: truncate(UNREADABLE, options.maxChars).text, links: [], removed: [], truncated: false, hidesText: true };
+    // With no doctype a browser reads HTML in quirks mode. One anywhere is taken as a doctype, which
+    // reads less as a length ({@link lengthValue}), so hides more, never less.
+    const rules = stylesheetRules(styles.sheets, body.content, !/<!doctype/i.test(body.content));
     const baseUrl = base !== undefined ? httpUrl(base) : undefined;
+    const page: Inherited = { color: [0, 0, 0, 1], background: [255, 255, 255, 1], fontSize: 16 };
     const html = serialize(root, {
       rules, counters, links, baseUrl, inlineImages: options.inlineImages ?? new Map(),
-    }, { color: [0, 0, 0, 1], background: [255, 255, 255, 1], fontSize: 16 });
+    }, [page, page, page]);
     markdown = htmlToMarkdown(html);
   }
   const { text, truncated } = truncate(markdown, options.maxChars);
@@ -422,14 +1817,29 @@ type SerializeContext = {
   inlineImages: ReadonlyMap<string, string>;
 };
 
-/** Writes the cleaned tree back as the plain HTML `htmlToMarkdown` reads. Iterative, so depth costs no stack. */
-function serialize(root: Element, context: SerializeContext, inherited: Inherited): string {
+/**
+ * Writes the cleaned tree back as the plain HTML `htmlToMarkdown` reads. Iterative, so depth costs no
+ * stack. What a Word list marker or a link holds is read as text from what was written of it, so
+ * nothing hidden in it is read: the outermost marker's is written in its place, and a link is named by it.
+ */
+function serialize(root: Element, context: SerializeContext, inherited: Readings): string {
   const out: string[] = [];
-  type Frame = { node: Node; inherited: Inherited } | { close: string };
-  const stack: Frame[] = root.children.map(node => ({ node, inherited })).toReversed();
+  type Frame = { node: Node; inherited: Readings } | { close: string; from: number; marker: boolean; link?: (text: string) => void };
+  // From the root, which stands for a browser's <html> and <body>, there however the message is written: a `*` rule applies to it.
+  const stack: Frame[] = [{ node: root, inherited }];
+  let inMarker = false;
   while (stack.length > 0) {
     const frame = stack.pop()!;
     if ("close" in frame) {
+      if (frame.marker || frame.link) {
+        const text = out.slice(frame.from).join("").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+        frame.link?.(decodeEntities(text));
+        if (frame.marker) {
+          out.length = frame.from;
+          out.push(WORD_BULLETS.test(text) ? "• " : `${text} `);
+          inMarker = false;
+        }
+      }
       out.push(frame.close);
       continue;
     }
@@ -441,15 +1851,18 @@ function serialize(root: Element, context: SerializeContext, inherited: Inherite
     const written = elementOut(node, frame.inherited, context);
     if (written === null) continue;
     out.push(written.open);
-    stack.push({ close: written.close });
+    const marker = written.marker === true && !inMarker;
+    if (marker) inMarker = true;
+    stack.push({ close: written.close, from: out.length, marker, link: written.link });
     if (written.leaf) continue;
-    for (let index = node.children.length - 1; index >= 0; index--) stack.push({ node: node.children[index]!, inherited: written.inherited });
+    const children = written.children ?? node.children;
+    for (let index = children.length - 1; index >= 0; index--) stack.push({ node: children[index]!, inherited: written.inherited });
   }
   return out.join("");
 }
 
-/** A text node as escaped HTML, or nothing when it is zero-size or background-coloured. */
-function textOut(raw: string, inherited: Inherited, counters: Counters): string {
+/** A text node as escaped HTML, or nothing when it is zero-size or background-coloured by any reading. */
+function textOut(raw: string, inherited: Readings, counters: Counters): string {
   const decoded = decodeEntities(raw);
   let invisible = 0;
   const visible = decoded.replace(INVISIBLE, char => {
@@ -460,7 +1873,7 @@ function textOut(raw: string, inherited: Inherited, counters: Counters): string 
     counters.invisibleChars += invisible;
     return escapeHtml(visible);
   }
-  if (inherited.fontSize <= MAX_HIDDEN_FONT_PX || colorDistance(blend(inherited.color, inherited.background), inherited.background) < INVISIBLE_DISTANCE) {
+  if (inherited.some(({ color, background, fontSize }) => fontSize <= MAX_HIDDEN_FONT_PX || colorDistance(blend(color, background), background) < INVISIBLE_DISTANCE)) {
     counters.hiddenRegions++;
     return " ";
   }
@@ -468,15 +1881,16 @@ function textOut(raw: string, inherited: Inherited, counters: Counters): string 
   return escapeHtml(visible);
 }
 
-/** Whether an element (with what it holds) has any text a person could read, ignoring whitespace. */
-function hasText(element: Element): boolean {
+/** Whether an element (with what it holds), or a list of nodes, has any text a person could read, ignoring whitespace. */
+function hasText(element: { readonly children: readonly Node[] }): boolean {
   const stack: Node[] = [...element.children];
   while (stack.length > 0) {
     const node = stack.pop()!;
     if (!isElement(node)) {
       if (decodeEntities(node.text).replace(INVISIBLE, "").trim() !== "") return true;
     } else if (!DROPPED.has(node.tag)) {
-      stack.push(...node.children);
+      // One at a time: spreading more than about 120,000 children into a call overflows the stack.
+      for (const child of node.children) stack.push(child);
     }
   }
   return false;
@@ -485,37 +1899,94 @@ function hasText(element: Element): boolean {
 /** Bullets Word writes as text before a list paragraph's content, which read better as a bullet. */
 const WORD_BULLETS = /^[·•o§▪■–-]$/;
 
-/** How an element is written: its replacement tags, what its contents inherit, and whether they are written at all. */
-type Written = { open: string; close: string; inherited: Inherited; leaf?: true };
+/**
+ * How an element is written: its replacement tags, what its contents inherit, whether they are written
+ * at all, which of them are when not all are, whether they are a Word list marker, and what names a
+ * link by them ({@link serialize}).
+ */
+type Written = {
+  open: string; close: string; inherited: Readings; leaf?: true; children?: readonly Node[]; marker?: true; link?: (text: string) => void;
+};
 
-function elementOut(element: Element, inherited: Inherited, context: SerializeContext): Written | null {
-  const { tag } = element;
-  if (DROPPED.has(tag)) return null;
-  const style = styleOf(element, context.rules);
-  if (hidesElement(style, { sized: tag !== "img" }) || "hidden" in element.attrs || [...context.rules.hiddenAttributes].some(name => Object.hasOwn(element.attrs, name))) {
-    if (hasText(element)) context.counters.hiddenRegions++;
-    return null;
-  }
+/** Whether an element a browser shows only with `open` (a <dialog>, a <details>) lacks it, by either reading of its attributes. */
+const closed = (element: Element) => !("open" in element.attrs) || (element.legacy !== undefined && !("open" in element.legacy));
+
+/** What an <rp> holds for a reader without ruby: a bracket, or nothing. Hidden, it isn't counted as hidden text. */
+const RUBY_BRACKET = /^[\t\n\f\r ]*[()[\]（）［］【】「」〔〕]?[\t\n\f\r ]*$/u;
+const rubyBracket = (element: Element) => element.tag === "rp"
+  && RUBY_BRACKET.test(element.children.map(child => (isElement(child) ? "\u0000" : child.text)).join(""));
+
+/** What an element's contents inherit, by one reading of its style. */
+function inheritedFrom(element: Element, style: Style, inherited: Inherited): Inherited {
   const next: Inherited = { ...inherited };
-  const color = parseColor(style.get("color")) ?? (tag === "font" ? parseColor(element.attrs.color) : undefined);
+  // `initial` is a browser's default text colour, black; the other CSS-wide keywords keep the inherited one.
+  const color = style.get("color") === "initial" ? [0, 0, 0, 1] as Rgba : parseColor(style.get("color")) ?? (element.tag === "font" ? parseColor(element.attrs.color) : undefined);
   if (color) next.color = color;
   const background = backgroundColor(element, style, inherited.background);
   if (background) next.background = background;
   const fontSize = style.get("font-size");
   if (fontSize !== undefined) {
-    const percent = /^([0-9.]+)%$/.exec(fontSize.trim());
-    const pixels = percent ? inherited.fontSize * Number(percent[1]) / 100 : cssLength(fontSize);
+    const pixels = fontPixels(fontSize, inherited.fontSize);
     if (pixels !== undefined) next.fontSize = pixels;
-  } else if (tag === "font" && element.attrs.size === "0") {
+  } else if (element.tag === "font" && element.attrs.size === "0") {
     next.fontSize = 0;
   }
-  // Word's list bullets, written as text in a span Outlook marks `mso-list:Ignore`.
-  if (style.get("mso-list") === "ignore") {
-    const text = plainTextOf(element).replace(/\s+/g, " ").trim();
-    return { open: WORD_BULLETS.test(text) ? "• " : `${escapeHtml(text)} `, close: "", inherited: next, leaf: true };
+  return next;
+}
+
+/**
+ * What an element's contents inherit by the reader before this one's reading of its style (`pin`,
+ * {@link styleOf}), as it read them: by its attributes as it read them, `color: initial` inherited,
+ * colours as it read them ({@link parseColor}), and a size a percentage or a {@link pinLength}.
+ */
+function pinInherited(element: Element, style: Style, inherited: Inherited): Inherited {
+  const attrs = element.legacy ?? element.attrs;
+  const next: Inherited = { ...inherited };
+  const color = parseColor(style.get("color"), true) ?? (element.tag === "font" ? parseColor(attrs.color, true) : undefined);
+  if (color) next.color = color;
+  const background = parseColor(style.get("background-color"), true) ?? parseColor(style.get("background"), true) ?? parseColor(attrs.bgcolor, true);
+  if (background) next.background = blend(background, inherited.background);
+  const fontSize = style.get("font-size");
+  if (fontSize !== undefined) {
+    const percent = /^([0-9.]+)%$/.exec(fontSize.trim());
+    const pixels = percent ? inherited.fontSize * Number(percent[1]) / 100 : pinLength(fontSize);
+    if (pixels !== undefined) next.fontSize = pixels;
+  } else if (element.tag === "font" && attrs.size === "0") {
+    next.fontSize = 0;
   }
+  return next;
+}
+
+/**
+ * How an element is written, or null when it is dropped or hidden: hidden by any reading of its style
+ * ({@link styleOf}), as the reader before this one read it or as a browser may.
+ */
+function elementOut(element: Element, inherited: Readings, context: SerializeContext): Written | null {
+  const { tag } = element;
+  if (DROPPED.has(tag)) return null;
+  const styles = styleOf(element, context.rules);
+  const sized = tag !== "img";
+  // A browser's own stylesheet hides a popover until a script opens it, as no mail's does; and
+  // <rp>, <datalist> and a <dialog> that isn't open. All are hidden here whatever else styles them.
+  const named = (attrs: Record<string, string>) => "hidden" in attrs || "popover" in attrs || Object.keys(attrs).some(name => context.rules.hiddenAttributes.has(name));
+  if (hidesElement(styles[0], { sized }) || hidesElement(styles[1], { sized }) || pinHides(styles[2], { sized })
+    || named(element.attrs) || (element.legacy !== undefined && named(element.legacy))
+    || tag === "rp" || tag === "datalist" || (tag === "dialog" && closed(element))) {
+    if (hasText(element) && !rubyBracket(element)) context.counters.hiddenRegions++;
+    return null;
+  }
+  const next = inherited.map((reading, at) => at === 2 ? pinInherited(element, styles[2], reading) : inheritedFrom(element, styles[at]!, reading));
+  // A <details> that isn't open shows only its first <summary>: a browser hides the rest, whatever styles it.
+  if (tag === "details" && closed(element)) {
+    const summary = element.children.find((child): child is Element => isElement(child) && child.tag === "summary");
+    const rest = element.children.filter(child => child !== summary);
+    if (hasText({ children: rest })) context.counters.hiddenRegions++;
+    return { open: "", close: "", inherited: next, children: summary ? [summary] : [] };
+  }
+  // Word's list bullets, written as text in a span Outlook marks `mso-list:Ignore`, where it certainly applies.
+  if (styles[0].get("mso-list") === "ignore") return { open: "", close: "", inherited: next, marker: true };
   switch (tag) {
-    case "img": return { open: imageOut(element, style, context), close: "", inherited: next, leaf: true };
+    case "img": return { open: imageOut(element, styles, context), close: "", inherited: next, leaf: true };
     case "a": return linkOut(element, next, context);
     case "table": {
       if (tableKind(element).data) return { open: "<table>", close: "</table>", inherited: next };
@@ -598,7 +2069,8 @@ function containsTag(element: Element, tag: string): boolean {
     const node = stack.pop()!;
     if (isElement(node)) {
       if (node.tag === tag) return true;
-      stack.push(...node.children);
+      // One at a time: spreading more than about 120,000 children into a call overflows the stack.
+      for (const child of node.children) stack.push(child);
     }
   }
   return false;
@@ -621,16 +2093,15 @@ function plainTextOf(element: Element): string {
 /** The most of an image's alt text shown: the sender's to write, at any length. */
 const MAX_ALT_CHARS = 200;
 
-/** An image as the placeholder text `htmlToMarkdown` writes, or nothing for a tracking or data image. */
-function imageOut(element: Element, style: ReadonlyMap<string, string>, context: SerializeContext): string {
+/** An image as the placeholder text `htmlToMarkdown` writes, or nothing for a data image or one tracking, at a pixel or two by any reading of its style. */
+function imageOut(element: Element, styles: readonly Style[], context: SerializeContext): string {
   const src = (element.attrs.src ?? "").trim();
-  const width = cssLength(element.attrs.width ?? style.get("width") ?? "");
-  const height = cssLength(element.attrs.height ?? style.get("height") ?? "");
+  const tiny = styles.some(style => ["width", "height"].some(side => (cssLength(element.attrs[side] ?? style.get(side) ?? "") ?? Infinity) <= 2));
   if (/^data:/i.test(src)) {
     context.counters.dataImages++;
     return "";
   }
-  if ((width !== undefined && width <= 2) || (height !== undefined && height <= 2) || (/^https?:/i.test(src) && TRACKER.test(src))) {
+  if (tiny || (/^https?:/i.test(src) && (TRACKER.test(src) || mailgunOpen(src)))) {
     context.counters.trackingImages++;
     return "";
   }
@@ -643,7 +2114,7 @@ function imageOut(element: Element, style: ReadonlyMap<string, string>, context:
 }
 
 /** A link with its real target, or just its text when the target isn't a web or email link. */
-function linkOut(element: Element, inherited: Inherited, context: SerializeContext): Written {
+function linkOut(element: Element, inherited: Readings, context: SerializeContext): Written {
   const raw = element.attrs.href?.trim();
   if (raw === undefined || raw === "" || raw.startsWith("#")) return { open: "", close: "", inherited };
   const resolved = resolveHref(raw, context.baseUrl);
@@ -653,16 +2124,15 @@ function linkOut(element: Element, inherited: Inherited, context: SerializeConte
   }
   const { url, unwrapped } = unwrapLink(resolved);
   if (unwrapped) context.counters.unwrapped++;
-  const text = plainTextOf(element).replace(INVISIBLE, "").replace(/\s+/g, " ").trim();
-  context.links.add(text || url, url);
-  return { open: `<a href="${escapeHtml(url)}">`, close: "</a>", inherited };
+  return { open: `<a href="${escapeHtml(url)}">`, close: "</a>", inherited, link: context.links.open(url) };
 }
 
 /** An absolute http(s) or mailto URL for an href, resolved against the message's <base>; else undefined. */
 function resolveHref(href: string, baseUrl: string | undefined): string | undefined {
   // oxlint-disable-next-line no-control-regex -- browsers ignore control characters and whitespace in schemes
   const cleaned = href.replace(/[\u0000- ]/g, char => char === " " ? "%20" : "");
-  if (/^mailto:/i.test(cleaned)) return /^mailto:[^\s<>"]+$/i.test(cleaned) ? cleaned : undefined;
+  // An invisible or format character in an address can reorder or hide part of it as shown.
+  if (/^mailto:/i.test(cleaned)) return /^mailto:[^\s<>"]+$/i.test(cleaned) && cleaned.search(INVISIBLE) === -1 && !/\p{Cf}/u.test(cleaned) ? cleaned : undefined;
   if (/^https?:/i.test(cleaned)) return httpUrl(cleaned);
   if (/^[a-z][a-z0-9+.-]*:/i.test(cleaned)) return undefined;
   return baseUrl ? httpUrl(cleaned, baseUrl) : undefined;
@@ -713,15 +2183,20 @@ export function unwrapLink(url: string): { url: string; unwrapped: boolean } {
 class LinkCollector {
   readonly #links = new Map<string, MessageLink>();
 
+  /** Takes a link's place in order as it opens, and returns what names it by its text (or else its target) once that is read. */
+  open(url: string): (text: string) => void {
+    let link = this.#links.get(url);
+    const first = link === undefined && this.#links.size < MAX_LINKS;
+    if (first) this.#links.set(url, link = { text: "", url });
+    return text => {
+      const shown = text || url;
+      if (first) link!.text = shown.slice(0, 500);
+      if (link && linkMismatch(shown, url)) link.mismatch = true;
+    };
+  }
+
   add(text: string, url: string): void {
-    const mismatch = linkMismatch(text, url);
-    const existing = this.#links.get(url);
-    if (existing) {
-      if (mismatch) existing.mismatch = true;
-      return;
-    }
-    if (this.#links.size >= MAX_LINKS) return;
-    this.#links.set(url, { text: text.slice(0, 500), url, ...(mismatch ? { mismatch: true as const } : {}) });
+    this.open(url)(text);
   }
 
   list(): MessageLink[] {
