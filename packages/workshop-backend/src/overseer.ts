@@ -355,12 +355,18 @@ function gatekeeperVendorId(record: GatekeeperRecord | undefined): string | unde
  */
 export const BROWSER_PANE_VENDOR_ID = "browser";
 
+/** Whether a connection is the workspace-owned ambient Browser Run connection. */
+export function isAmbientBrowserGatekeeper(
+    record: Pick<GatekeeperRecord, "creationSpec">): boolean {
+  let spec = record.creationSpec;
+  return spec?.type === "ambient" && spec.vendorId.toLowerCase() === BROWSER_PANE_VENDOR_ID;
+}
+
 /** Finds the workspace-owned ambient Browser Run connection by its vendor id. */
 export function findAmbientBrowserGatekeeper<T extends Pick<GatekeeperRecord, "id" | "creationSpec">>(
     records: Iterable<T>): T | undefined {
   for (let record of records) {
-    let spec = record.creationSpec;
-    if (spec?.type === "ambient" && spec.vendorId.toLowerCase() === BROWSER_PANE_VENDOR_ID) {
+    if (isAmbientBrowserGatekeeper(record)) {
       return record;
     }
   }
@@ -11308,12 +11314,34 @@ class OverseerImpl implements AgentHooks {
           profileId, this.users.get(this.users.idFromName(profileId)));
       ownerChoices = this.storage.actorAccounts.get(profileId);
     }
+    // Only Browser Run learns who asked and which gateway message this turn answers.
+    // These fields identify the notice destination; the verifier remains the authority.
+    let identity: {profileId: string; externalMessageKey?: string} | undefined;
+    if (profileId !== undefined && vendorId !== null && isAmbientBrowserGatekeeper(record)) {
+      let externalMessageKey = this.#externalMessageKeyFor(caller);
+      identity = externalMessageKey === undefined ? {profileId} : {profileId, externalMessageKey};
+    }
     return resolveSessionActor(
         profileId, gatekeeperId, vendorId, observer, ownerChoices,
         (pid, accountId, vendor) => {
           let user = this.users.get(this.users.idFromName(pid));
           return user.getVerifier(accountId, vendor);
-        });
+        }, identity);
+  }
+
+  // A later person's message starts its own turn, so the previous gateway delivery no longer
+  // identifies this caller's origin. Callback turns carry no person and never reach this scan.
+  #externalMessageKeyFor(caller: GatekeeperCaller): string | undefined {
+    if (caller.from !== "agent") return undefined;
+    let delivery = this.storage.gadgetResponseDeliveries.undeliveredByChatId.get(caller.chatId);
+    if (delivery?.status !== "waiting") return undefined;
+    let chatPrefix = `${keyString(caller.chatId)}.`;
+    for (let message of this.storage.chats.list({
+      prefix: chatPrefix, startAfter: `${chatPrefix}${keyString(delivery.promptSequence)}`,
+    })) {
+      if (message.type === "message" && message.author.type === "user") return undefined;
+    }
+    return delivery.idempotencyKey;
   }
 
   // Render the observer verification failures as one line per binding, naming the connection and the

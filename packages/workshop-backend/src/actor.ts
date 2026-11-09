@@ -21,7 +21,9 @@ export type ActorChoiceRecord = {
 
 /**
  * Pick the session actor for one gatekeeper. `vendorId` null means the binding has no per-user
- * credential (AI model, spawner) and needs no actor.
+ * credential (AI model, spawner) and needs no actor. `identity` is who asked and where, given only
+ * for the Browser Run connection (the overseer's isAmbientBrowserGatekeeper); it is passed through,
+ * never checked, and grants nothing.
  */
 export async function resolveSessionActor(
     profileId: string | undefined,
@@ -32,17 +34,18 @@ export async function resolveSessionActor(
     getVerifier: (
       profileId: string, accountId: number, vendorId: string,
     ) => Promise<Fetcher<GatekeeperUserVerifier> | null>,
+    identity?: { profileId: string; externalMessageKey?: string },
 ): Promise<GatekeeperSessionActor | undefined> {
   if (profileId === undefined || vendorId === null) return undefined;
 
   const choices = observer?.accountChoices ?? ownerChoices?.accountChoices;
   const accountId = choices?.[gatekeeperId];
-  const observerId = observer?.observerId;
+  const named: GatekeeperSessionActor = { observerId: observer?.observerId, ...identity };
   if (accountId === undefined) {
-    return { observerId };
+    return named;
   }
 
   const verifier = await getVerifier(profileId, accountId, vendorId);
-  if (!verifier) return { observerId };
-  return { observerId, verifier };
+  if (!verifier) return named;
+  return { ...named, verifier };
 }

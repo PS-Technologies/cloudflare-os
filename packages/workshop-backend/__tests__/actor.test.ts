@@ -51,4 +51,28 @@ describe("resolveSessionActor", () => {
         }))
         .resolves.toEqual({ verifier: VERIFIER });
   });
+
+  it("names nobody and nowhere unless the overseer passes an identity", async () => {
+    await expect(resolveSessionActor(
+        "alice", 2, "test", undefined, { accountChoices: { 2: 9 } }, async () => VERIFIER))
+        .resolves.toStrictEqual({ observerId: undefined, verifier: VERIFIER });
+  });
+
+  it("passes the browser connection's identity through, with or without a verifier", async () => {
+    const identity = { profileId: "alice@example.com", externalMessageKey: "teams:conversation:activity" };
+    await expect(resolveSessionActor(
+        "alice@example.com", 2, "browser", undefined, { accountChoices: { 2: 9 } },
+        async () => VERIFIER, identity))
+        .resolves.toEqual({ ...identity, verifier: VERIFIER });
+    await expect(resolveSessionActor(
+        "alice@example.com", 2, "browser", undefined, undefined, async () => VERIFIER, identity))
+        .resolves.toEqual(identity);
+  });
+
+  it("gives a headless caller no actor even with an identity", async () => {
+    await expect(resolveSessionActor(
+        undefined, 2, "browser", undefined, undefined, async () => VERIFIER,
+        { profileId: "alice@example.com" }))
+        .resolves.toBeUndefined();
+  });
 });
